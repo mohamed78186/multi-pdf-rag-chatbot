@@ -8,13 +8,16 @@ import tempfile
 import streamlit as st
 
 from rag_utils import (
+    DEFAULT_FETCH_K,
+    DEFAULT_TOP_N,
     ask,
+    build_hybrid_retriever,
     build_rag_chain,
     build_vectorstore,
     format_sources,
     get_embeddings,
     get_llm,
-    get_retriever,
+    get_reranker,
     load_pdfs,
     split_documents,
 )
@@ -31,11 +34,31 @@ MAX_FILE_SIZE_MB = 10
 MAX_FILES = 3
 
 
+# Cache heavyweight resources across reruns/questions instead of reloading
+# the embedding model, the reranker, and the LLM client every single time.
+@st.cache_resource(show_spinner=False)
+def cached_get_embeddings():
+    return get_embeddings()
+
+
+@st.cache_resource(show_spinner=False)
+def cached_get_reranker():
+    return get_reranker()
+
+
+@st.cache_resource(show_spinner=False)
+def cached_get_llm():
+    return get_llm()
+
+
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
 if "vectordb" not in st.session_state:
     st.session_state.vectordb = None
+
+if "chunks" not in st.session_state:
+    st.session_state.chunks = []
 
 if "sources_available" not in st.session_state:
     st.session_state.sources_available = []
@@ -73,6 +96,30 @@ with st.sidebar:
         value=80,
         step=20,
     )
+
+    with st.expander("🎯 Accuracy settings"):
+        top_n = st.slider(
+            "Chunks sent to the model (after reranking)",
+            min_value=3,
+            max_value=10,
+            value=DEFAULT_TOP_N,
+            help=(
+                "More chunks = more coverage but more chance of noise. "
+                "Fewer chunks = more focused, precise answers."
+            ),
+        )
+
+        fetch_k = st.slider(
+            "Candidates retrieved before reranking",
+            min_value=10,
+            max_value=40,
+            value=DEFAULT_FETCH_K,
+            step=5,
+            help=(
+                "How many chunks the hybrid (keyword + vector) search pulls "
+                "before the cross-encoder reranker narrows them down."
+            ),
+        )
 
     process_clicked = st.button(
         "🔄 Process PDFs",
@@ -168,7 +215,7 @@ if process_clicked:
                         chunk_overlap=chunk_overlap,
                     )
 
-                    embeddings = get_embeddings()
+                    embeddings = cached_get_embeddings()
 
                     vectordb = build_vectorstore(
                         chunks,
@@ -177,6 +224,7 @@ if process_clicked:
                     )
 
                     st.session_state.vectordb = vectordb
+                    st.session_state.chunks = chunks
 
                     st.session_state.sources_available = sorted(
                         {
@@ -203,7 +251,7 @@ if process_clicked:
 st.title("📚 Multi-PDF RAG Chatbot")
 
 st.caption(
-    "BGE Embeddings + ChromaDB + Gemini"
+    "BGE Embeddings + BM25 Hybrid Search + Cross-Encoder Reranking + Gemini"
 )
 
 
@@ -247,45 +295,23 @@ else:
             try:
                 with st.spinner("Thinking..."):
 
-                    question_lower = question.lower()
-
-                    broad_words = [
-                        "all",
-                        "list",
-                        "every",
-                        "projects",
-                        "skills",
-                        "experience",
-                        "education",
-                        "certifications",
-                        "certificates",
-                        "courses",
-                        "technologies",
-                    ]
-
-                    dynamic_k = (
-                        7
-                        if any(
-                            word in question_lower
-                            for word in broad_words
-                        )
-                        else 3
-                    )
-
-                    retriever = get_retriever(
+                    retriever = build_hybrid_retriever(
                         st.session_state.vectordb,
-                        k=dynamic_k,
+                        st.session_state.chunks,
+                        fetch_k=fetch_k,
                         sources=selected_sources or None,
                     )
 
-                    llm = get_llm()
-
+                    reranker = cached_get_reranker()
+                    llm = cached_get_llm()
                     chain = build_rag_chain(llm)
 
                     answer, docs = ask(
                         retriever,
+                        reranker,
                         chain,
                         question,
+                        top_n=top_n,
                     )
 
                     sources_md = format_sources(docs)

@@ -163,23 +163,39 @@ def get_retriever(
     vectordb: Chroma,
     k: int = 4,
     sources: Optional[List[str]] = None,
-    search_type: str = "similarity",
+    search_type: str = "similarity_score_threshold",
+    score_threshold: float = 0.45,
 ):
     """
-    Defaults to plain similarity search: for factual Q&A, pulling the
-    top-k *most relevant* chunks is more accurate than MMR, which
+    Defaults to similarity search with a minimum relevance score: for
+    factual Q&A, pulling the top-k *most relevant* chunks (and dropping
+    anything below `score_threshold`) is more accurate than MMR, which
     deliberately trades relevance for diversity and can drop a chunk
     that repeats (but confirms) the right answer.
 
+    The score threshold matters most when several unrelated PDFs are
+    indexed together (e.g. a CV + an unrelated slide deck): without it,
+    a "give me everything" style question can pull in chunks from a
+    completely different document just to fill up k, polluting both the
+    answer's context and the Sources list. score_threshold=0.45 (cosine
+    similarity, since embeddings are normalized) is a reasonable default;
+    raise it (e.g. 0.6) to be stricter, lower it if relevant chunks are
+    being dropped for a large/varied document.
+
     Pass search_type="mmr" if you specifically want broader, less
-    redundant coverage (e.g. for very open-ended "summarize everything"
-    style questions).
+    redundant coverage across ONE topic (e.g. very open-ended
+    "summarize everything in this document" style questions).
     """
     if search_type == "mmr":
         search_kwargs = {
             "k": k,
-            "fetch_k": max(k * 4, 20),
+            "fetch_k": max(k * 3, 15),
             "lambda_mult": 0.5,
+        }
+    elif search_type == "similarity_score_threshold":
+        search_kwargs = {
+            "k": k,
+            "score_threshold": score_threshold,
         }
     else:
         search_kwargs = {"k": k}
@@ -197,12 +213,24 @@ def get_retriever(
     )
 
 
+def _display_page(page) -> str:
+    """
+    pypdf's page metadata is 0-indexed (first page = 0). Convert to the
+    1-indexed page/slide number a human would actually see, so the number
+    the LLM quotes in its answer matches the number shown in the Sources
+    expander (format_sources below) instead of being off by one.
+    """
+    if isinstance(page, int):
+        return str(page + 1)
+    return str(page) if page is not None else "?"
+
+
 def _format_docs(docs: List[Document]) -> str:
     parts = []
 
     for d in docs:
         src = d.metadata.get("source", "unknown")
-        page = d.metadata.get("page", "?")
+        page = _display_page(d.metadata.get("page"))
 
         parts.append(
             f"[Source: {src} | Page: {page}]\n"
@@ -319,18 +347,13 @@ def format_sources(docs: List[Document]) -> str:
 
     for d in docs:
         src = d.metadata.get("source", "unknown")
-        page = d.metadata.get("page", "?")
+        raw_page = d.metadata.get("page")
+        page_display = _display_page(raw_page)
 
-        key = (src, page)
+        key = (src, page_display)
 
         if key not in seen:
             seen.add(key)
-
-            page_display = (
-                page + 1
-                if isinstance(page, int)
-                else page
-            )
 
             lines.append(
                 f"- {src} (page {page_display})"

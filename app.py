@@ -6,6 +6,13 @@ import os
 import tempfile
 
 import streamlit as st
+from dotenv import load_dotenv
+
+# Loads GOOGLE_API_KEY (and anything else) from a local .env file if one
+# exists. Harmless no-op if the key is already set another way (shell env,
+# Streamlit Cloud secrets, etc.) - os.environ values set elsewhere are not
+# overwritten.
+load_dotenv()
 
 from rag_utils import (
     DEFAULT_FETCH_K,

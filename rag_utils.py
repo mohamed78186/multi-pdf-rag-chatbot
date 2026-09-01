@@ -3,13 +3,14 @@ rag_utils.py
 ------------
 Multi-PDF RAG using BGE embeddings + ChromaDB + Gemini.
 
-Accuracy-focused pipeline:
+Pipeline:
 PDFs
--> Load + clean text
+-> Load
 -> Chunk
--> BGE Embeddings (dense) + BM25 (sparse) hybrid retrieval
--> Cross-Encoder reranking (precision step)
--> Gemini (strict, grounded prompt)
+-> BGE Embeddings
+-> ChromaDB
+-> Retriever
+-> Gemini
 -> Answer + Sources
 """
 
@@ -22,126 +23,42 @@ from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_community.retrievers import BM25Retriever
-from langchain_classic.retrievers import EnsembleRetriever
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_huggingface import HuggingFaceEmbeddings
 
 
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
+
 CHAT_MODEL = "gemini-3.5-flash-lite"
 
-# Small + fast dense embedding model. Precision is recovered later by the
-# cross-encoder reranker, so we don't need a heavy embedding model here.
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 
-# Lightweight cross-encoder reranker. Cheap enough to run on CPU (Streamlit
-# Cloud free tier) while giving a large precision boost over raw vector/BM25
-# retrieval, because it actually reads (question, chunk) pairs together
-# instead of comparing embeddings.
-RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
-# How many candidates to pull from each retriever before reranking, and how
-# many of the reranked, highest-scoring chunks are finally sent to the LLM.
-DEFAULT_FETCH_K = 20
-DEFAULT_TOP_N = 6
+SYSTEM_PROMPT = """You are a helpful assistant that answers questions using ONLY the
+context provided below, which was retrieved from one or more PDF documents.
 
-# Questions that ask for an enumeration ("list all X", "every Y") need many
-# more chunks than a narrow factual question, or items get silently dropped
-# because the reranker can only keep a handful of the highest-scoring chunks.
-# When one of these words appears, fetch_k/top_n are scaled up automatically.
-BROAD_QUERY_WORDS = [
-    "all",
-    "list",
-    "every",
-    "each",
-    "projects",
-    "skills",
-    "experience",
-    "experiences",
-    "education",
-    "certifications",
-    "certificates",
-    "courses",
-    "technologies",
-    "responsibilities",
-    "summarize",
-    "summary",
-    "overview",
-]
-
-BROAD_FETCH_K_MULTIPLIER = 2.0
-BROAD_TOP_N_MULTIPLIER = 2.5
-
-# Cross-encoder relevance cutoffs (see rerank_documents). ms-marco-MiniLM
-# outputs an unbounded relevance logit, not a 0-1 probability: higher =
-# more relevant, and a genuinely irrelevant chunk from an unrelated PDF
-# will typically score several points lower than a real match. These are
-# deliberately conservative (favor keeping a borderline chunk over
-# dropping a real one) - tune down RERANK_RELEVANCE_GAP if you still see
-# unrelated sources slipping into answers.
-RERANK_MIN_SCORE = -3.0
-RERANK_RELEVANCE_GAP = 6.0
-
-
-def is_broad_query(question: str) -> bool:
-    """Heuristic: does this question ask for an enumeration/full listing?"""
-    q = question.lower()
-    return any(word in q for word in BROAD_QUERY_WORDS)
-
-
-def resolve_retrieval_params(
-    question: str,
-    fetch_k: int = DEFAULT_FETCH_K,
-    top_n: int = DEFAULT_TOP_N,
-):
-    """
-    Scale fetch_k/top_n up for enumeration-style questions so that items
-    spread across many chunks (e.g. several CV projects) aren't truncated
-    by the reranker keeping only a small, narrowly "most relevant" set.
-    """
-    if is_broad_query(question):
-        fetch_k = max(fetch_k, int(fetch_k * BROAD_FETCH_K_MULTIPLIER))
-        top_n = max(top_n, int(top_n * BROAD_TOP_N_MULTIPLIER))
-
-    return fetch_k, top_n
-
-
-# Canonical "no answer" message. Used both in the prompt (so the LLM knows
-# the exact string to reply with) and in ask() (so we can detect that exact
-# reply and avoid showing misleading "Sources" for an answer that isn't
-# actually grounded in them). Keeping a single constant means the two can
-# never drift out of sync.
-NO_ANSWER_MSG = "I don't know based on the provided document(s)."
-
-SYSTEM_PROMPT = f"""You are a precise research assistant. Answer the user's question
-using ONLY the context excerpts below, which were retrieved from the user's PDF
-document(s).
-
-Rules (follow strictly):
-1. Base your answer strictly on the given context. Never use outside knowledge,
-   even if you are confident it is correct.
-2. If the context does not contain the answer, reply exactly:
-   "{NO_ANSWER_MSG}"
-3. If the context only partially answers the question, answer only the
-   supported part, and say explicitly which part is not covered.
-4. Copy numbers, dates, names, and technical terms exactly as written in the
-   context. Do not paraphrase, round, or "correct" them.
-5. If the question asks for a specific count or a list of items, include
-   exactly the items found in the context (no more, no fewer), and note if
-   the context might be incomplete.
-6. Do not merge or infer connections across different documents unless the
-   context explicitly makes that connection.
-7. After every factual claim, cite where it came from like this:
-   (source: <file name>, p.<page>).
-8. Be concise, factual, and avoid speculation, filler, or hedging language
-   beyond what rule 2/3 require.
+Rules:
+- Answer strictly using the given context. Do not use outside knowledge.
+- If the answer is not contained in the context, reply exactly with:
+  "I don't know based on the provided document(s)."
+- If the question asks for a specific number of items, list EXACTLY that many.
+- If the context only partially answers the question, answer only the supported part.
+- Do not infer unsupported connections across documents.
+- When useful, mention which document(s) the answer came from.
+- Be concise and factual.
 
 Context:
-{{context}}
+{context}
 """
 
+
+# ---------------------------------------------------------------------------
+# API key
+# ---------------------------------------------------------------------------
 
 def get_api_key(explicit_key: Optional[str] = None) -> str:
     key = explicit_key or os.environ.get("GOOGLE_API_KEY")
@@ -153,35 +70,44 @@ def get_api_key(explicit_key: Optional[str] = None) -> str:
     return key
 
 
-def get_embeddings(model_name: str = EMBEDDING_MODEL):
+# ---------------------------------------------------------------------------
+# Embeddings
+# ---------------------------------------------------------------------------
+
+def get_embeddings(provider: Optional[str] = None):
+    """
+    Local BGE embeddings.
+    No Gemini embedding quota is used.
+    """
+
     return HuggingFaceEmbeddings(
-        model_name=model_name,
-        model_kwargs={"device": "cpu"},
-        encode_kwargs={"normalize_embeddings": True},
+        model_name=EMBEDDING_MODEL,
+        model_kwargs={
+            "device": "cpu"
+        },
+        encode_kwargs={
+            "normalize_embeddings": True
+        },
     )
 
 
-def get_reranker(model_name: str = RERANKER_MODEL):
-    """Cross-encoder reranker: scores (question, chunk) pairs directly."""
-    from sentence_transformers import CrossEncoder
+# ---------------------------------------------------------------------------
+# Gemini LLM
+# ---------------------------------------------------------------------------
 
-    return CrossEncoder(model_name, max_length=512)
-
-
-def get_llm(temperature: float = 0.0):
+def get_llm(
+    temperature: float = 0.0,
+    provider: Optional[str] = None,
+):
     return ChatGoogleGenerativeAI(
         model=CHAT_MODEL,
         temperature=temperature,
     )
 
 
-def _clean_text(text: str) -> str:
-    """Normalize whitespace/line breaks left over from PDF extraction."""
-    text = text.replace("\u00a0", " ")
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
+# ---------------------------------------------------------------------------
+# PDF loading
+# ---------------------------------------------------------------------------
 
 def load_pdfs(pdf_paths: Sequence[str]) -> List[Document]:
     all_docs: List[Document] = []
@@ -194,16 +120,19 @@ def load_pdfs(pdf_paths: Sequence[str]) -> List[Document]:
             d.metadata["source"] = os.path.basename(
                 d.metadata.get("source", path)
             )
-            d.page_content = _clean_text(d.page_content)
 
         all_docs.extend(docs)
 
     return all_docs
 
 
+# ---------------------------------------------------------------------------
+# Chunking
+# ---------------------------------------------------------------------------
+
 def split_documents(
     docs: List[Document],
-    chunk_size: int = 800,
+    chunk_size: int = 700,
     chunk_overlap: int = 80,
 ) -> List[Document]:
 
@@ -213,29 +142,24 @@ def split_documents(
         separators=["\n\n", "\n", ". ", " ", ""],
     )
 
-    chunks = splitter.split_documents(docs)
+    return splitter.split_documents(docs)
 
-    # Drop near-empty chunks (page numbers, running headers, etc.) that add
-    # noise to retrieval without adding information.
-    return [c for c in chunks if len(c.page_content.strip()) >= 20]
 
+# ---------------------------------------------------------------------------
+# Vector store
+# ---------------------------------------------------------------------------
 
 def build_vectorstore(
     chunks: List[Document],
     embeddings,
-    persist_directory=None,
+    persist_directory: str,
     collection_name: str = "rag_collection",
 ) -> Chroma:
-    """
-    In-memory ChromaDB.
-
-    No persist_directory is used, so Streamlit Cloud does not need
-    to write to a local SQLite database.
-    """
 
     vectordb = Chroma(
         collection_name=collection_name,
         embedding_function=embeddings,
+        persist_directory=persist_directory,
     )
 
     vectordb.add_documents(chunks)
@@ -243,123 +167,44 @@ def build_vectorstore(
     return vectordb
 
 
-def _filter_chunks_by_source(
-    chunks: List[Document],
-    sources: Optional[List[str]],
-) -> List[Document]:
-    if not sources:
-        return chunks
+# ---------------------------------------------------------------------------
+# Retriever
+# ---------------------------------------------------------------------------
 
-    filtered = [c for c in chunks if c.metadata.get("source") in sources]
-    return filtered or chunks
-
-
-def build_hybrid_retriever(
+def get_retriever(
     vectordb: Chroma,
-    chunks: List[Document],
-    fetch_k: int = DEFAULT_FETCH_K,
+    k: int = 3,
     sources: Optional[List[str]] = None,
+    score_threshold: Optional[float] = None,
 ):
-    """
-    Hybrid retrieval = dense vector search (MMR) + sparse BM25 keyword
-    search, combined. BM25 matters a lot for accuracy: exact names, numbers,
-    codes, or rare terms are often matched better by keyword overlap than by
-    embedding similarity, especially with a small embedding model.
-    """
 
-    filtered_chunks = _filter_chunks_by_source(chunks, sources)
-
-    bm25_retriever = BM25Retriever.from_documents(filtered_chunks)
-    bm25_retriever.k = fetch_k
-
-    vector_search_kwargs = {
-        "k": fetch_k,
-        "fetch_k": max(fetch_k * 3, 30),
-        "lambda_mult": 0.7,
+    search_kwargs = {
+        "k": k
     }
 
     if sources:
-        vector_search_kwargs["filter"] = {"source": {"$in": sources}}
+        search_kwargs["filter"] = {
+            "source": {
+                "$in": sources
+            }
+        }
 
-    vector_retriever = vectordb.as_retriever(
-        search_type="mmr",
-        search_kwargs=vector_search_kwargs,
-    )
+    if score_threshold is not None:
+        search_kwargs["score_threshold"] = score_threshold
 
-    return EnsembleRetriever(
-        retrievers=[bm25_retriever, vector_retriever],
-        weights=[0.4, 0.6],
-    )
-
-
-def _dedupe_docs(docs: List[Document]) -> List[Document]:
-    seen = set()
-    unique_docs = []
-
-    for d in docs:
-        key = (
-            d.metadata.get("source"),
-            d.metadata.get("page"),
-            d.page_content[:120],
+        return vectordb.as_retriever(
+            search_type="similarity_score_threshold",
+            search_kwargs=search_kwargs,
         )
 
-        if key not in seen:
-            seen.add(key)
-            unique_docs.append(d)
-
-    return unique_docs
-
-
-def rerank_documents(
-    reranker,
-    question: str,
-    docs: List[Document],
-    top_n: int = DEFAULT_TOP_N,
-    relevance_gap: float = RERANK_RELEVANCE_GAP,
-    min_score: float = RERANK_MIN_SCORE,
-) -> List[Document]:
-    """
-    Re-score deduplicated candidates with a cross-encoder and keep the
-    relevant ones, up to top_n.
-
-    top_n is a CEILING, not a target: if the corpus contains multiple
-    unrelated PDFs (e.g. a CV + an unrelated slide deck) and only a few
-    chunks are truly relevant to the question, we must not "pad" the
-    remaining slots with the next-best-available but still irrelevant
-    chunks from a different document. We do this with two safeguards:
-
-    1. min_score: an absolute floor. Chunks scored below this by the
-       cross-encoder are considered irrelevant regardless of anything else.
-    2. relevance_gap: a relative floor. Chunks scored much lower than the
-       single best-matching chunk for this question are dropped, even if
-       they technically clear min_score - they're just not in the same
-       league as the real answer.
-    """
-
-    unique_docs = _dedupe_docs(docs)
-
-    if not unique_docs:
-        return []
-
-    pairs = [[question, d.page_content] for d in unique_docs]
-    scores = reranker.predict(pairs)
-
-    scored = sorted(
-        zip(scores, unique_docs),
-        key=lambda pair: pair[0],
-        reverse=True,
+    return vectordb.as_retriever(
+        search_kwargs=search_kwargs
     )
 
-    top_score = scored[0][0]
 
-    relevant = [
-        (score, doc)
-        for score, doc in scored
-        if score >= min_score and score >= (top_score - relevance_gap)
-    ]
-
-    return [doc for _, doc in relevant[:top_n]]
-
+# ---------------------------------------------------------------------------
+# Format docs
+# ---------------------------------------------------------------------------
 
 def _format_docs(docs: List[Document]) -> str:
     parts = []
@@ -367,17 +212,21 @@ def _format_docs(docs: List[Document]) -> str:
     for d in docs:
         src = d.metadata.get("source", "unknown")
         page = d.metadata.get("page", "?")
-        page_display = page + 1 if isinstance(page, int) else page
 
         parts.append(
-            f"[Source: {src} | Page: {page_display}]\n"
+            f"[Source: {src} | Page: {page}]\n"
             f"{d.page_content}"
         )
 
     return "\n\n---\n\n".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# RAG chain
+# ---------------------------------------------------------------------------
+
 def build_rag_chain(llm: ChatGoogleGenerativeAI):
+
     prompt = ChatPromptTemplate.from_messages(
         [
             ("system", SYSTEM_PROMPT),
@@ -387,6 +236,10 @@ def build_rag_chain(llm: ChatGoogleGenerativeAI):
 
     return prompt | llm | StrOutputParser()
 
+
+# ---------------------------------------------------------------------------
+# Gemini rate limit handling
+# ---------------------------------------------------------------------------
 
 def _extract_retry_delay(
     error_text: str,
@@ -431,6 +284,7 @@ def _invoke_chain_with_retry(
             return chain.invoke(inputs)
 
         except Exception as e:
+
             if not _is_rate_limit_error(e):
                 raise
 
@@ -445,6 +299,7 @@ def _invoke_chain_with_retry(
             )
 
             time.sleep(wait_time)
+
             delay = min(delay * 2, 60)
 
     raise RuntimeError(
@@ -452,18 +307,23 @@ def _invoke_chain_with_retry(
     )
 
 
+# ---------------------------------------------------------------------------
+# Ask
+# ---------------------------------------------------------------------------
+
 def ask(
     retriever,
-    reranker,
     chain,
     question: str,
-    top_n: int = DEFAULT_TOP_N,
 ):
-    raw_docs = retriever.invoke(question)
-    docs = rerank_documents(reranker, question, raw_docs, top_n=top_n)
+
+    docs = retriever.invoke(question)
 
     if not docs:
-        return (NO_ANSWER_MSG, [])
+        return (
+            "I don't know based on the provided document(s).",
+            [],
+        )
 
     context = _format_docs(docs)
 
@@ -475,17 +335,15 @@ def ask(
         },
     )
 
-    # The reranker can still let through a few weakly-related chunks (that's
-    # by design - see rerank_documents' relevance_gap comment). If the LLM
-    # itself decided those chunks weren't enough to answer, don't show them
-    # as "Sources" - that would wrongly imply the answer came from them.
-    if answer.strip() == NO_ANSWER_MSG:
-        return (answer, [])
-
     return answer, docs
 
 
+# ---------------------------------------------------------------------------
+# Sources
+# ---------------------------------------------------------------------------
+
 def format_sources(docs: List[Document]) -> str:
+
     seen = set()
     lines = []
 

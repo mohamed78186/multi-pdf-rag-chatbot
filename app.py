@@ -110,6 +110,14 @@ with st.sidebar:
     if st.session_state.sources_available:
         st.subheader("📄 Search only these PDFs")
 
+        if len(st.session_state.sources_available) > 1:
+            st.caption(
+                "⚠️ Multiple unrelated PDFs are indexed together. "
+                "Uncheck the ones not relevant to your question — "
+                "otherwise the answer/Sources may pull in chunks from "
+                "the wrong document."
+            )
+
         selected_sources = []
 
         for src in st.session_state.sources_available:
@@ -301,13 +309,13 @@ else:
                     # Broad/"list everything" questions need wide, diverse
                     # coverage (MMR); specific factual questions get precise
                     # top-k similarity search.
-                    dynamic_k = 10 if is_broad else 4
+                    dynamic_k = 6 if is_broad else 4
 
                     retriever = get_retriever(
                         st.session_state.vectordb,
                         k=dynamic_k,
                         sources=selected_sources or None,
-                        search_type="mmr" if is_broad else "similarity",
+                        search_type="mmr" if is_broad else "similarity_score_threshold",
                     )
 
                     llm = get_cached_llm()

@@ -9,12 +9,13 @@ import streamlit as st
 
 from rag_utils import (
     ask,
+    build_bm25_index,
     build_rag_chain,
     build_vectorstore,
     format_sources,
     get_embeddings,
     get_llm,
-    get_retriever,
+    get_reranker,
     load_pdfs,
     split_documents,
 )
@@ -43,9 +44,10 @@ MAX_FILE_SIZE_MB = 10
 MAX_FILES = 3
 
 
-# Loading the BGE embedding model and creating the LLM client are the two
-# expensive/slow steps. Cache them as resources so every rerun (every click,
-# every chat message) doesn't reload the embedding model from disk/HF cache.
+# Loading the BGE embedding model, the cross-encoder reranker, and creating
+# the LLM client are the expensive/slow steps. Cache them as resources so
+# every rerun (every click, every chat message) doesn't reload them from
+# disk/HF cache.
 @st.cache_resource(show_spinner=False)
 def get_cached_embeddings():
     return get_embeddings()
@@ -56,11 +58,19 @@ def get_cached_llm():
     return get_llm()
 
 
+@st.cache_resource(show_spinner=False)
+def get_cached_reranker():
+    return get_reranker()
+
+
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
 if "vectordb" not in st.session_state:
     st.session_state.vectordb = None
+
+if "bm25_index" not in st.session_state:
+    st.session_state.bm25_index = None
 
 if "sources_available" not in st.session_state:
     st.session_state.sources_available = []
@@ -209,7 +219,14 @@ if process_clicked:
                         collection_name="rag_collection_bge",
                     )
 
+                    # BM25 (keyword/sparse) index, built over the same
+                    # chunks/chunk_ids as the vector store. Combined with
+                    # vectordb at question time for hybrid search — see
+                    # rag_utils.hybrid_pool / ask().
+                    bm25_index = build_bm25_index(chunks)
+
                     st.session_state.vectordb = vectordb
+                    st.session_state.bm25_index = bm25_index
 
                     st.session_state.sources_available = sorted(
                         {
@@ -236,7 +253,7 @@ if process_clicked:
 st.title("📚 Multi-PDF RAG Chatbot")
 
 st.caption(
-    "BGE Embeddings + ChromaDB + Gemini"
+    "BGE Embeddings + BM25 Hybrid Search + Cross-Encoder Rerank + ChromaDB + Gemini"
 )
 
 
@@ -278,7 +295,7 @@ else:
         with st.chat_message("assistant"):
 
             try:
-                with st.spinner("Thinking..."):
+                with st.spinner("Searching and thinking..."):
 
                     question_lower = question.lower()
 
@@ -306,33 +323,35 @@ else:
                         for word in broad_words
                     )
 
-                    # Broad/"list everything" questions get a higher k and a
-                    # slightly lower relevance bar (they may need more chunks
-                    # from the SAME document to be complete); specific
-                    # factual questions get a tighter, more precise search.
-                    # Both paths go through the same relevance-score filter
-                    # (see get_retriever/_ScoreThresholdRetriever) so an
-                    # unrelated document loaded in the same session never
-                    # gets pulled in just to fill up k.
-                    dynamic_k = 8 if is_broad else 4
-                    dynamic_threshold = 0.35 if is_broad else 0.45
-
-                    retriever = get_retriever(
-                        st.session_state.vectordb,
-                        k=dynamic_k,
-                        sources=selected_sources or None,
-                        search_type="similarity_score_threshold",
-                        score_threshold=dynamic_threshold,
-                    )
+                    # Broad/"list everything" questions get a bigger
+                    # hybrid candidate pool, more chunks kept after
+                    # reranking, and a looser relevance bar (they may
+                    # need more chunks from the SAME document to be
+                    # complete). Specific factual questions get a
+                    # tighter pool and a stricter relevance bar. Either
+                    # way, every chunk that reaches the LLM has passed
+                    # through the cross-encoder reranker's score
+                    # threshold, so an unrelated document loaded in the
+                    # same session never gets pulled in just to fill k.
+                    final_k = 8 if is_broad else 4
+                    score_threshold = 0.15 if is_broad else 0.3
+                    pool_size = max(final_k * 4, 15)
 
                     llm = get_cached_llm()
+                    reranker = get_cached_reranker()
 
                     chain = build_rag_chain(llm)
 
                     answer, docs = ask(
-                        retriever,
+                        st.session_state.vectordb,
+                        st.session_state.bm25_index,
                         chain,
                         question,
+                        reranker=reranker,
+                        sources=selected_sources or None,
+                        pool_size=pool_size,
+                        final_k=final_k,
+                        score_threshold=score_threshold,
                     )
 
                     sources_md = format_sources(docs)

@@ -18,7 +18,9 @@ from rag_utils import (
     get_embeddings,
     get_llm,
     get_reranker,
+    is_broad_query,
     load_pdfs,
+    resolve_retrieval_params,
     split_documents,
 )
 
@@ -250,9 +252,6 @@ if process_clicked:
 
 st.title("📚 Multi-PDF RAG Chatbot")
 
-st.caption(
-    "BGE Embeddings + BM25 Hybrid Search + Cross-Encoder Reranking + Gemini"
-)
 
 
 if not st.session_state.vectordb:
@@ -295,10 +294,22 @@ else:
             try:
                 with st.spinner("Thinking..."):
 
+                    effective_fetch_k, effective_top_n = resolve_retrieval_params(
+                        question,
+                        fetch_k=fetch_k,
+                        top_n=top_n,
+                    )
+
+                    if is_broad_query(question):
+                        st.caption(
+                            "🔎 Detected a broad/listing question — "
+                            "searching more thoroughly to avoid missing items."
+                        )
+
                     retriever = build_hybrid_retriever(
                         st.session_state.vectordb,
                         st.session_state.chunks,
-                        fetch_k=fetch_k,
+                        fetch_k=effective_fetch_k,
                         sources=selected_sources or None,
                     )
 
@@ -311,7 +322,7 @@ else:
                         reranker,
                         chain,
                         question,
-                        top_n=top_n,
+                        top_n=effective_top_n,
                     )
 
                     sources_md = format_sources(docs)

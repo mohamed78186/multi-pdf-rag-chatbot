@@ -3,7 +3,6 @@ Streamlit UI - Multi-PDF RAG Chatbot
 """
 
 import os
-import shutil
 import tempfile
 
 import streamlit as st
@@ -40,11 +39,6 @@ if "vectordb" not in st.session_state:
 
 if "sources_available" not in st.session_state:
     st.session_state.sources_available = []
-
-if "persist_dir" not in st.session_state:
-    st.session_state.persist_dir = tempfile.mkdtemp(
-        prefix="rag_chroma_"
-    )
 
 
 with st.sidebar:
@@ -174,27 +168,11 @@ if process_clicked:
                         chunk_overlap=chunk_overlap,
                     )
 
-                    if os.path.exists(
-                        st.session_state.persist_dir
-                    ):
-                        shutil.rmtree(
-                            st.session_state.persist_dir,
-                            ignore_errors=True,
-                        )
-
-                    os.makedirs(
-                        st.session_state.persist_dir,
-                        exist_ok=True,
-                    )
-
                     embeddings = get_embeddings()
 
                     vectordb = build_vectorstore(
                         chunks,
                         embeddings,
-                        persist_directory=(
-                            st.session_state.persist_dir
-                        ),
                         collection_name="rag_collection_bge",
                     )
 

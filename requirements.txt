@@ -2,6 +2,9 @@ langchain
 langchain-community
 langchain-text-splitters
 langchain-google-genai
+langchain-ollama
+langchain-chroma
+chromadb
 pypdf
 streamlit
-scikit-learn
+notebook

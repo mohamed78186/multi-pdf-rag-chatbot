@@ -306,16 +306,23 @@ else:
                         for word in broad_words
                     )
 
-                    # Broad/"list everything" questions need wide, diverse
-                    # coverage (MMR); specific factual questions get precise
-                    # top-k similarity search.
-                    dynamic_k = 6 if is_broad else 4
+                    # Broad/"list everything" questions get a higher k and a
+                    # slightly lower relevance bar (they may need more chunks
+                    # from the SAME document to be complete); specific
+                    # factual questions get a tighter, more precise search.
+                    # Both paths go through the same relevance-score filter
+                    # (see get_retriever/_ScoreThresholdRetriever) so an
+                    # unrelated document loaded in the same session never
+                    # gets pulled in just to fill up k.
+                    dynamic_k = 8 if is_broad else 4
+                    dynamic_threshold = 0.35 if is_broad else 0.45
 
                     retriever = get_retriever(
                         st.session_state.vectordb,
                         k=dynamic_k,
                         sources=selected_sources or None,
-                        search_type="mmr" if is_broad else "similarity_score_threshold",
+                        search_type="similarity_score_threshold",
+                        score_threshold=dynamic_threshold,
                     )
 
                     llm = get_cached_llm()

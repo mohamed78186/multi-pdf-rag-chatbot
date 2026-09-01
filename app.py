@@ -68,7 +68,7 @@ with st.sidebar:
         "Chunk size",
         min_value=400,
         max_value=1500,
-        value=700,
+        value=800,
         step=100,
     )
 
@@ -130,7 +130,6 @@ if process_clicked:
         )
 
     else:
-
         file_too_large = False
 
         for f in uploaded_files:
@@ -150,7 +149,6 @@ if process_clicked:
                 with st.spinner(
                     "Loading, chunking, and indexing your PDF(s)..."
                 ):
-
                     tmp_dir = tempfile.mkdtemp(
                         prefix="rag_uploads_"
                     )
@@ -219,22 +217,9 @@ if process_clicked:
                 st.rerun()
 
             except Exception as e:
-                error_text = str(e)
-
-                if (
-                    "429" in error_text
-                    or "RESOURCE_EXHAUSTED" in error_text
-                    or "quota" in error_text.lower()
-                ):
-                    st.warning(
-                        "The AI service is temporarily busy or "
-                        "the demo quota has been reached. "
-                        "Please try again later."
-                    )
-                else:
-                    st.error(
-                        "Something went wrong while processing the PDF files."
-                    )
+                st.error(
+                    f"Processing error: {str(e)}"
+                )
 
 
 st.title("📚 Multi-PDF RAG Chatbot")
@@ -295,6 +280,7 @@ else:
                         "experience",
                         "education",
                         "certifications",
+                        "certificates",
                         "courses",
                         "technologies",
                     ]
@@ -340,19 +326,6 @@ else:
                 )
 
             except Exception as e:
-                error_text = str(e)
-
-                if (
-                    "429" in error_text
-                    or "RESOURCE_EXHAUSTED" in error_text
-                    or "quota" in error_text.lower()
-                ):
-                    st.warning(
-                        "The AI service is temporarily busy or "
-                        "the demo quota has been reached. "
-                        "Please try again later."
-                    )
-                else:
-                    st.error(
-                        "Something went wrong while generating the answer."
-                    )
+                st.error(
+                    f"Error: {str(e)}"
+                )

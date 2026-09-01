@@ -147,16 +147,61 @@ def build_vectorstore(
 
     No persist_directory is used, so Streamlit Cloud does not need
     to write to a local SQLite database.
+
+    collection_metadata forces cosine distance explicitly (Chroma's
+    default is L2). BGE embeddings are normalized specifically for
+    cosine similarity (see get_embeddings), and get_retriever's manual
+    score-threshold filtering assumes a 0-1, higher-is-better cosine
+    relevance score — so this must stay set for that filtering to be
+    meaningful.
     """
 
     vectordb = Chroma(
         collection_name=collection_name,
         embedding_function=embeddings,
+        collection_metadata={"hnsw:space": "cosine"},
     )
 
     vectordb.add_documents(chunks)
 
     return vectordb
+
+
+class _ScoreThresholdRetriever:
+    """
+    Minimal drop-in replacement for
+    vectordb.as_retriever(search_type="similarity_score_threshold", ...).
+
+    That built-in LangChain search_type has known cross-version
+    reliability issues (a pydantic validation error on some
+    langchain-core versions even when score_threshold is a valid
+    float). Filtering by score ourselves, directly against
+    similarity_search_with_relevance_scores, sidesteps that entirely
+    and is easier to reason about/debug.
+    """
+
+    def __init__(self, vectordb: Chroma, k: int, score_threshold: float, filter_dict=None):
+        self.vectordb = vectordb
+        self.k = k
+        self.score_threshold = score_threshold
+        self.filter_dict = filter_dict
+
+    def invoke(self, query: str) -> List[Document]:
+        kwargs = {}
+        if self.filter_dict:
+            kwargs["filter"] = self.filter_dict
+
+        results = self.vectordb.similarity_search_with_relevance_scores(
+            query,
+            k=self.k,
+            **kwargs,
+        )
+
+        return [
+            doc
+            for doc, score in results
+            if score >= self.score_threshold
+        ]
 
 
 def get_retriever(
@@ -178,7 +223,8 @@ def get_retriever(
     a "give me everything" style question can pull in chunks from a
     completely different document just to fill up k, polluting both the
     answer's context and the Sources list. score_threshold=0.45 (cosine
-    similarity, since embeddings are normalized) is a reasonable default;
+    similarity, since embeddings are normalized and the collection uses
+    cosine distance — see build_vectorstore) is a reasonable default;
     raise it (e.g. 0.6) to be stricter, lower it if relevant chunks are
     being dropped for a large/varied document.
 
@@ -186,26 +232,27 @@ def get_retriever(
     redundant coverage across ONE topic (e.g. very open-ended
     "summarize everything in this document" style questions).
     """
+    filter_dict = {"source": {"$in": sources}} if sources else None
+
+    if search_type == "similarity_score_threshold":
+        return _ScoreThresholdRetriever(
+            vectordb,
+            k=k,
+            score_threshold=score_threshold,
+            filter_dict=filter_dict,
+        )
+
     if search_type == "mmr":
         search_kwargs = {
             "k": k,
             "fetch_k": max(k * 3, 15),
             "lambda_mult": 0.5,
         }
-    elif search_type == "similarity_score_threshold":
-        search_kwargs = {
-            "k": k,
-            "score_threshold": score_threshold,
-        }
     else:
         search_kwargs = {"k": k}
 
-    if sources:
-        search_kwargs["filter"] = {
-            "source": {
-                "$in": sources
-            }
-        }
+    if filter_dict:
+        search_kwargs["filter"] = filter_dict
 
     return vectordb.as_retriever(
         search_type=search_type,

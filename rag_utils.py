@@ -1,18 +1,16 @@
 """
 rag_utils.py
 ------------
-Shared building blocks for the Multi-PDF RAG Chatbot.
+Multi-PDF RAG using TF-IDF retrieval + Gemini generation.
 
 Pipeline:
-    PDF(s)
-    -> PyPDFLoader
-    -> RecursiveCharacterTextSplitter
-    -> Local HuggingFace Embeddings
-    -> ChromaDB
-    -> Retriever
-    -> Prompt + Context
-    -> Gemini LLM
-    -> Answer + Sources
+PDFs
+-> Load
+-> Chunk
+-> TF-IDF index
+-> Retrieve top matching chunks
+-> Gemini
+-> Answer + Sources
 """
 
 import os
@@ -20,14 +18,15 @@ import re
 import time
 from typing import List, Optional, Sequence
 
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_chroma import Chroma
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_huggingface import HuggingFaceEmbeddings
 
 
 # ---------------------------------------------------------------------------
@@ -35,8 +34,6 @@ from langchain_huggingface import HuggingFaceEmbeddings
 # ---------------------------------------------------------------------------
 
 CHAT_MODEL = "gemini-3.5-flash-lite"
-
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 
 SYSTEM_PROMPT = """You are a helpful assistant that answers questions using ONLY the
@@ -46,14 +43,9 @@ Rules:
 - Answer strictly using the given context. Do not use outside knowledge.
 - If the answer is not contained in the context, reply exactly with:
   "I don't know based on the provided document(s)."
-- If the question asks for a specific number of items (e.g. "three causes"),
-  list EXACTLY that many — the number stated in the source text, not more.
-- Never pad the list with related-but-distinct items from elsewhere in the context.
-- If the context only partially answers the question, answer only the part
-  that is supported and say what's missing.
-- Do not fill gaps with outside knowledge.
-- If the question requires connecting facts across multiple documents and the
-  context does not explicitly state that connection, do not infer or synthesize it.
+- If the question asks for a specific number of items, list EXACTLY that many.
+- If the context only partially answers the question, answer only the supported part.
+- Do not infer unsupported connections across documents.
 - When useful, mention which document(s) the answer came from.
 - Be concise and factual.
 
@@ -67,56 +59,23 @@ Context:
 # ---------------------------------------------------------------------------
 
 def get_api_key(explicit_key: Optional[str] = None) -> str:
-    """
-    Resolve the Gemini API key from an explicit argument or environment variable.
-    """
-
     key = explicit_key or os.environ.get("GOOGLE_API_KEY")
 
     if not key:
-        raise RuntimeError(
-            "GOOGLE_API_KEY is not configured."
-        )
+        raise RuntimeError("GOOGLE_API_KEY is not configured.")
 
     os.environ["GOOGLE_API_KEY"] = key
     return key
 
 
 # ---------------------------------------------------------------------------
-# Embeddings
-# ---------------------------------------------------------------------------
-
-def get_embeddings(provider: Optional[str] = None):
-    """
-    Local free embeddings.
-
-    These embeddings run locally on the Streamlit server and do not consume
-    Gemini embedding quota.
-    """
-
-    return HuggingFaceEmbeddings(
-        model_name=EMBEDDING_MODEL,
-        model_kwargs={
-            "device": "cpu"
-        },
-        encode_kwargs={
-            "normalize_embeddings": True
-        },
-    )
-
-
-# ---------------------------------------------------------------------------
-# LLM
+# Gemini LLM
 # ---------------------------------------------------------------------------
 
 def get_llm(
     temperature: float = 0.0,
-    provider: Optional[str] = None
+    provider: Optional[str] = None,
 ):
-    """
-    Gemini chat model used only for final answer generation.
-    """
-
     return ChatGoogleGenerativeAI(
         model=CHAT_MODEL,
         temperature=temperature,
@@ -124,24 +83,13 @@ def get_llm(
 
 
 # ---------------------------------------------------------------------------
-# Loading PDFs
+# PDF loading
 # ---------------------------------------------------------------------------
 
-def load_pdfs(
-    pdf_paths: Sequence[str]
-) -> List[Document]:
-    """
-    Load one or more PDF files with PyPDFLoader.
-
-    Metadata keeps:
-    - source
-    - page
-    """
-
+def load_pdfs(pdf_paths: Sequence[str]) -> List[Document]:
     all_docs: List[Document] = []
 
     for path in pdf_paths:
-
         loader = PyPDFLoader(path)
         docs = loader.load()
 
@@ -164,123 +112,141 @@ def split_documents(
     chunk_size: int = 700,
     chunk_overlap: int = 80,
 ) -> List[Document]:
-    """
-    Split documents into chunks.
-    """
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
-        separators=[
-            "\n\n",
-            "\n",
-            ". ",
-            " ",
-            "",
-        ],
+        separators=["\n\n", "\n", ". ", " ", ""],
     )
 
     return splitter.split_documents(docs)
 
 
 # ---------------------------------------------------------------------------
-# Vector store
+# TF-IDF vector store
 # ---------------------------------------------------------------------------
+
+class TfidfVectorStore:
+    def __init__(self, chunks: List[Document]):
+        self.chunks = chunks
+
+        self.vectorizer = TfidfVectorizer(
+            lowercase=True,
+            stop_words="english",
+            ngram_range=(1, 2),
+        )
+
+        texts = [doc.page_content for doc in chunks]
+
+        self.matrix = self.vectorizer.fit_transform(texts)
+
+    def search(
+        self,
+        query: str,
+        k: int = 3,
+        sources: Optional[List[str]] = None,
+    ) -> List[Document]:
+
+        query_vector = self.vectorizer.transform([query])
+
+        scores = cosine_similarity(
+            query_vector,
+            self.matrix,
+        ).flatten()
+
+        ranked_indices = scores.argsort()[::-1]
+
+        results = []
+
+        for idx in ranked_indices:
+            doc = self.chunks[idx]
+
+            if sources:
+                source = doc.metadata.get("source")
+                if source not in sources:
+                    continue
+
+            if scores[idx] <= 0:
+                continue
+
+            results.append(doc)
+
+            if len(results) >= k:
+                break
+
+        return results
+
 
 def build_vectorstore(
     chunks: List[Document],
-    embeddings,
-    persist_directory: str,
+    embeddings=None,
+    persist_directory=None,
     collection_name: str = "rag_collection",
-) -> Chroma:
-    """
-    Create a ChromaDB vector store using local HuggingFace embeddings.
-
-    No Gemini embedding API calls are made here.
-    """
-
-    vectordb = Chroma(
-        collection_name=collection_name,
-        embedding_function=embeddings,
-        persist_directory=persist_directory,
-    )
-
-    vectordb.add_documents(chunks)
-
-    return vectordb
+):
+    return TfidfVectorStore(chunks)
 
 
 # ---------------------------------------------------------------------------
 # Retriever
 # ---------------------------------------------------------------------------
 
+class TfidfRetriever:
+    def __init__(
+        self,
+        vectorstore: TfidfVectorStore,
+        k: int = 3,
+        sources: Optional[List[str]] = None,
+    ):
+        self.vectorstore = vectorstore
+        self.k = k
+        self.sources = sources
+
+    def invoke(self, question: str) -> List[Document]:
+        return self.vectorstore.search(
+            query=question,
+            k=self.k,
+            sources=self.sources,
+        )
+
+
 def get_retriever(
-    vectordb: Chroma,
+    vectordb,
     k: int = 3,
     sources: Optional[List[str]] = None,
     score_threshold: Optional[float] = None,
 ):
-    """
-    Build a retriever.
-
-    Optional:
-    - restrict search to selected source PDFs
-    - use a similarity threshold
-    """
-
-    search_kwargs = {
-        "k": k
-    }
-
-    if sources:
-        search_kwargs["filter"] = {
-            "source": {
-                "$in": sources
-            }
-        }
-
-    if score_threshold is not None:
-
-        search_kwargs["score_threshold"] = score_threshold
-
-        return vectordb.as_retriever(
-            search_type="similarity_score_threshold",
-            search_kwargs=search_kwargs,
-        )
-
-    return vectordb.as_retriever(
-        search_kwargs=search_kwargs
+    return TfidfRetriever(
+        vectorstore=vectordb,
+        k=k,
+        sources=sources,
     )
 
 
 # ---------------------------------------------------------------------------
-# Formatting retrieved documents
+# Compatibility function
 # ---------------------------------------------------------------------------
 
-def _format_docs(
-    docs: List[Document]
-) -> str:
+def get_embeddings(provider: Optional[str] = None):
     """
-    Format retrieved documents before sending them to Gemini.
+    Kept only so app.py does not need major changes.
+    TF-IDF does not use embeddings.
     """
+    return None
 
+
+# ---------------------------------------------------------------------------
+# Format retrieved docs
+# ---------------------------------------------------------------------------
+
+def _format_docs(docs: List[Document]) -> str:
     parts = []
 
     for d in docs:
-
-        src = d.metadata.get(
-            "source",
-            "unknown"
-        )
-
-        page = d.metadata.get(
-            "page",
-            "?"
-        )
+        src = d.metadata.get("source", "unknown")
+        page = d.metadata.get("page", "?")
 
         parts.append(
-            f"[Source: {src} | Page: {page}]\n"
-            f"{d.page_content}"
+            f"[Source: {src} | Page: {page}]\n{d.page_content}"
         )
 
     return "\n\n---\n\n".join(parts)
@@ -290,50 +256,30 @@ def _format_docs(
 # RAG chain
 # ---------------------------------------------------------------------------
 
-def build_rag_chain(
-    llm: ChatGoogleGenerativeAI
-):
-    """
-    Create the prompt -> Gemini -> text output chain.
-    """
+def build_rag_chain(llm: ChatGoogleGenerativeAI):
 
     prompt = ChatPromptTemplate.from_messages(
         [
-            (
-                "system",
-                SYSTEM_PROMPT,
-            ),
-            (
-                "human",
-                "Question: {question}",
-            ),
+            ("system", SYSTEM_PROMPT),
+            ("human", "Question: {question}"),
         ]
     )
 
-    return (
-        prompt
-        | llm
-        | StrOutputParser()
-    )
+    return prompt | llm | StrOutputParser()
 
 
 # ---------------------------------------------------------------------------
-# Gemini rate limit handling
+# Gemini rate-limit handling
 # ---------------------------------------------------------------------------
 
 class DailyQuotaExceeded(RuntimeError):
-    """
-    Raised when Gemini daily quota is exhausted.
-    """
+    pass
 
 
 def _extract_retry_delay(
     error_text: str,
     fallback: float,
 ) -> float:
-    """
-    Extract Gemini's recommended retry delay.
-    """
 
     match = re.search(
         r"retry in ([\d.]+)s",
@@ -343,74 +289,20 @@ def _extract_retry_delay(
 
     if match:
         try:
-            return float(
-                match.group(1)
-            ) + 2
+            return float(match.group(1)) + 2
         except ValueError:
             pass
 
     return fallback
 
 
-def _is_rate_limit_error(
-    e: Exception
-) -> bool:
-    """
-    Detect Gemini 429 / quota errors.
-    """
-
+def _is_rate_limit_error(e: Exception) -> bool:
     text = str(e)
 
     return (
         "RESOURCE_EXHAUSTED" in text
         or "429" in text
-        or getattr(
-            e,
-            "code",
-            None,
-        ) == 429
-    )
-
-
-def _classify_and_wait(
-    error_text: str,
-    attempt: int,
-    max_retries: int,
-    delay: float,
-) -> float:
-    """
-    Handle Gemini API rate-limit errors.
-    """
-
-    lower_text = error_text.lower()
-
-    if (
-        "perday" in lower_text
-        or "per day" in lower_text
-        or "requestsperday" in lower_text
-    ):
-
-        raise DailyQuotaExceeded(
-            "Gemini daily quota has been reached. "
-            "Please try again later."
-        )
-
-    if attempt >= max_retries - 1:
-
-        raise RuntimeError(
-            "Gemini is temporarily rate limited."
-        )
-
-    wait_time = _extract_retry_delay(
-        error_text,
-        delay,
-    )
-
-    time.sleep(wait_time)
-
-    return min(
-        delay * 2,
-        60,
+        or getattr(e, "code", None) == 429
     )
 
 
@@ -419,30 +311,30 @@ def _invoke_chain_with_retry(
     inputs: dict,
     max_retries: int = 4,
 ) -> str:
-    """
-    Call Gemini with retry handling for temporary 429 errors.
-    """
 
     delay = 5
 
-    for attempt in range(
-        max_retries
-    ):
-
+    for attempt in range(max_retries):
         try:
             return chain.invoke(inputs)
 
         except Exception as e:
-
             if not _is_rate_limit_error(e):
                 raise
 
-            delay = _classify_and_wait(
+            if attempt >= max_retries - 1:
+                raise RuntimeError(
+                    "Gemini is temporarily unavailable or quota has been reached."
+                )
+
+            wait_time = _extract_retry_delay(
                 str(e),
-                attempt,
-                max_retries,
                 delay,
             )
+
+            time.sleep(wait_time)
+
+            delay = min(delay * 2, 60)
 
     raise RuntimeError(
         "Unable to get a response from Gemini."
@@ -458,17 +350,16 @@ def ask(
     chain,
     question: str,
 ):
-    """
-    Retrieve relevant chunks and ask Gemini using only the retrieved context.
-    """
 
-    docs = retriever.invoke(
-        question
-    )
+    docs = retriever.invoke(question)
 
-    context = _format_docs(
-        docs
-    )
+    if not docs:
+        return (
+            "I don't know based on the provided document(s).",
+            [],
+        )
+
+    context = _format_docs(docs)
 
     answer = _invoke_chain_with_retry(
         chain,
@@ -485,35 +376,18 @@ def ask(
 # Sources
 # ---------------------------------------------------------------------------
 
-def format_sources(
-    docs: List[Document]
-) -> str:
-    """
-    Format source PDF names and page numbers.
-    """
+def format_sources(docs: List[Document]) -> str:
 
     seen = set()
     lines = []
 
     for d in docs:
+        src = d.metadata.get("source", "unknown")
+        page = d.metadata.get("page", "?")
 
-        src = d.metadata.get(
-            "source",
-            "unknown"
-        )
-
-        page = d.metadata.get(
-            "page",
-            "?"
-        )
-
-        key = (
-            src,
-            page,
-        )
+        key = (src, page)
 
         if key not in seen:
-
             seen.add(key)
 
             page_display = (
@@ -526,7 +400,4 @@ def format_sources(
                 f"- {src} (page {page_display})"
             )
 
-    if lines:
-        return "\n".join(lines)
-
-    return "- no sources retrieved"
+    return "\n".join(lines) if lines else "- no sources retrieved"

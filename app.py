@@ -1,16 +1,5 @@
 """
-Streamlit UI - Multi-PDF RAG Chatbot (Gemini edition)
-
-Run with:
-    streamlit run app.py
-
-Features:
-  - Upload multiple PDFs dynamically
-  - One shared ChromaDB collection across all uploaded PDFs
-  - Checkbox list to choose which PDFs to search
-  - Adjustable k
-  - Chat interface with conversation history
-  - Shows source filename + page number
+Streamlit UI - Multi-PDF RAG Chatbot
 """
 
 import os
@@ -31,15 +20,17 @@ from rag_utils import (
     split_documents,
 )
 
+
 st.set_page_config(
     page_title="Multi-PDF RAG Chatbot",
     page_icon="📚",
     layout="wide",
 )
 
-# ---------------------------------------------------------------------------
-# Session state
-# ---------------------------------------------------------------------------
+
+MAX_FILE_SIZE_MB = 10
+MAX_FILES = 3
+
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -51,14 +42,10 @@ if "sources_available" not in st.session_state:
     st.session_state.sources_available = []
 
 if "persist_dir" not in st.session_state:
-    st.session_state.persist_dir = tempfile.mkdtemp(prefix="rag_chroma_")
+    st.session_state.persist_dir = tempfile.mkdtemp(
+        prefix="rag_chroma_"
+    )
 
-# Gemini only
-st.session_state.provider = "gemini"
-
-# ---------------------------------------------------------------------------
-# Sidebar
-# ---------------------------------------------------------------------------
 
 with st.sidebar:
     st.header("⚙️ Setup")
@@ -71,25 +58,26 @@ with st.sidebar:
     st.divider()
 
     uploaded_files = st.file_uploader(
-        "Upload one or more PDF files",
+        "Upload PDF files",
         type=["pdf"],
         accept_multiple_files=True,
+        help=f"Maximum {MAX_FILES} files, {MAX_FILE_SIZE_MB} MB each.",
     )
 
     chunk_size = st.slider(
         "Chunk size",
-        min_value=200,
-        max_value=2000,
-        value=800,
+        min_value=400,
+        max_value=1500,
+        value=700,
         step=100,
     )
 
     chunk_overlap = st.slider(
         "Chunk overlap",
         min_value=0,
-        max_value=500,
-        value=100,
-        step=50,
+        max_value=300,
+        value=80,
+        step=20,
     )
 
     process_clicked = st.button(
@@ -100,20 +88,17 @@ with st.sidebar:
 
     st.divider()
 
-    k = st.slider(
-        "Retriever k (chunks to retrieve)",
-        min_value=1,
-        max_value=10,
-        value=4,
-    )
-
     if st.session_state.sources_available:
         st.subheader("📄 Search only these PDFs")
 
         selected_sources = []
 
         for src in st.session_state.sources_available:
-            if st.checkbox(src, value=True, key=f"cb_{src}"):
+            if st.checkbox(
+                src,
+                value=True,
+                key=f"cb_{src}",
+            ):
                 selected_sources.append(src)
 
     else:
@@ -126,15 +111,12 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
 
-# ---------------------------------------------------------------------------
-# Process PDFs
-# ---------------------------------------------------------------------------
 
 if process_clicked:
 
     if not os.environ.get("GOOGLE_API_KEY"):
         st.sidebar.error(
-            "Gemini API key is not configured in Streamlit Secrets."
+            "Gemini API key is not configured."
         )
 
     elif not uploaded_files:
@@ -142,99 +124,135 @@ if process_clicked:
             "Please upload at least one PDF."
         )
 
+    elif len(uploaded_files) > MAX_FILES:
+        st.sidebar.error(
+            f"Please upload at most {MAX_FILES} PDF files."
+        )
+
     else:
-        try:
-            with st.spinner(
-                "Loading, chunking, and embedding your PDF(s)..."
-            ):
-                tmp_dir = tempfile.mkdtemp(prefix="rag_uploads_")
 
-                saved_paths = []
+        file_too_large = False
 
-                for f in uploaded_files:
-                    path = os.path.join(tmp_dir, f.name)
+        for f in uploaded_files:
+            file_size_mb = len(f.getbuffer()) / (1024 * 1024)
 
-                    with open(path, "wb") as out:
-                        out.write(f.getbuffer())
-
-                    saved_paths.append(path)
-
-                # Load PDFs
-                docs = load_pdfs(saved_paths)
-
-                # Split into chunks
-                chunks = split_documents(
-                    docs,
-                    chunk_size=chunk_size,
-                    chunk_overlap=chunk_overlap,
+            if file_size_mb > MAX_FILE_SIZE_MB:
+                st.sidebar.error(
+                    f"{f.name} is too large. "
+                    f"Maximum allowed size is {MAX_FILE_SIZE_MB} MB."
                 )
+                file_too_large = True
+                break
 
-                # Remove previous Chroma collection
-                if os.path.exists(st.session_state.persist_dir):
-                    shutil.rmtree(
-                        st.session_state.persist_dir,
-                        ignore_errors=True,
+        if not file_too_large:
+
+            try:
+                with st.spinner(
+                    "Loading, chunking, and indexing your PDF(s)..."
+                ):
+
+                    tmp_dir = tempfile.mkdtemp(
+                        prefix="rag_uploads_"
                     )
 
-                os.makedirs(
-                    st.session_state.persist_dir,
-                    exist_ok=True,
+                    saved_paths = []
+
+                    for f in uploaded_files:
+                        path = os.path.join(
+                            tmp_dir,
+                            f.name,
+                        )
+
+                        with open(path, "wb") as out:
+                            out.write(f.getbuffer())
+
+                        saved_paths.append(path)
+
+                    docs = load_pdfs(saved_paths)
+
+                    chunks = split_documents(
+                        docs,
+                        chunk_size=chunk_size,
+                        chunk_overlap=chunk_overlap,
+                    )
+
+                    if os.path.exists(
+                        st.session_state.persist_dir
+                    ):
+                        shutil.rmtree(
+                            st.session_state.persist_dir,
+                            ignore_errors=True,
+                        )
+
+                    os.makedirs(
+                        st.session_state.persist_dir,
+                        exist_ok=True,
+                    )
+
+                    embeddings = get_embeddings()
+
+                    vectordb = build_vectorstore(
+                        chunks,
+                        embeddings,
+                        persist_directory=(
+                            st.session_state.persist_dir
+                        ),
+                        collection_name="rag_collection_bge",
+                    )
+
+                    st.session_state.vectordb = vectordb
+
+                    st.session_state.sources_available = sorted(
+                        {
+                            d.metadata["source"]
+                            for d in docs
+                        }
+                    )
+
+                    st.session_state.messages = []
+
+                st.sidebar.success(
+                    f"Indexed {len(chunks)} chunks from "
+                    f"{len(st.session_state.sources_available)} PDF(s)."
                 )
 
-                # Gemini embeddings
-                embeddings = get_embeddings(
-                    provider="gemini"
-                )
+                st.rerun()
 
-                # Build vector store
-                vectordb = build_vectorstore(
-                    chunks,
-                    embeddings,
-                    persist_directory=st.session_state.persist_dir,
-                    collection_name="rag_collection_gemini",
-                )
+            except Exception as e:
+                error_text = str(e)
 
-                st.session_state.vectordb = vectordb
+                if (
+                    "429" in error_text
+                    or "RESOURCE_EXHAUSTED" in error_text
+                    or "quota" in error_text.lower()
+                ):
+                    st.warning(
+                        "The AI service is temporarily busy or "
+                        "the demo quota has been reached. "
+                        "Please try again later."
+                    )
+                else:
+                    st.error(
+                        "Something went wrong while processing the PDF files."
+                    )
 
-                st.session_state.sources_available = sorted(
-                    {
-                        d.metadata["source"]
-                        for d in docs
-                    }
-                )
-
-                st.session_state.messages = []
-
-            st.sidebar.success(
-                f"Indexed {len(chunks)} chunks from "
-                f"{len(st.session_state.sources_available)} PDF(s)."
-            )
-
-            st.rerun()
-
-        except Exception as e:
-            st.error(f"Error while processing PDFs: {e}")
-
-# ---------------------------------------------------------------------------
-# Main Chat Area
-# ---------------------------------------------------------------------------
 
 st.title("📚 Multi-PDF RAG Chatbot")
 
 st.caption(
-    "LangChain + ChromaDB + Google Gemini"
+    "BGE Embeddings + ChromaDB + Gemini"
 )
+
 
 if not st.session_state.vectordb:
 
     st.info(
-        "👈 Upload PDFs and click **Process PDFs** "
-        "in the sidebar to get started."
+        "👈 Upload your PDF files and click "
+        "**Process PDFs** to get started."
     )
 
 else:
 
-    # Show previous chat messages
     for msg in st.session_state.messages:
 
         with st.chat_message(msg["role"]):
@@ -245,7 +263,6 @@ else:
                 with st.expander("Sources"):
                     st.markdown(msg["sources"])
 
-    # User question
     question = st.chat_input(
         "Ask a question about your PDF(s)..."
     )
@@ -267,15 +284,37 @@ else:
             try:
                 with st.spinner("Thinking..."):
 
+                    question_lower = question.lower()
+
+                    broad_words = [
+                        "all",
+                        "list",
+                        "every",
+                        "projects",
+                        "skills",
+                        "experience",
+                        "education",
+                        "certifications",
+                        "courses",
+                        "technologies",
+                    ]
+
+                    dynamic_k = (
+                        7
+                        if any(
+                            word in question_lower
+                            for word in broad_words
+                        )
+                        else 3
+                    )
+
                     retriever = get_retriever(
                         st.session_state.vectordb,
-                        k=k,
+                        k=dynamic_k,
                         sources=selected_sources or None,
                     )
 
-                    llm = get_llm(
-                        provider="gemini"
-                    )
+                    llm = get_llm()
 
                     chain = build_rag_chain(llm)
 
@@ -301,6 +340,19 @@ else:
                 )
 
             except Exception as e:
-                st.error(
-                    f"Error while generating answer: {e}"
-                )
+                error_text = str(e)
+
+                if (
+                    "429" in error_text
+                    or "RESOURCE_EXHAUSTED" in error_text
+                    or "quota" in error_text.lower()
+                ):
+                    st.warning(
+                        "The AI service is temporarily busy or "
+                        "the demo quota has been reached. "
+                        "Please try again later."
+                    )
+                else:
+                    st.error(
+                        "Something went wrong while generating the answer."
+                    )

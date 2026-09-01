@@ -1,3 +1,8 @@
+# CPU-only torch wheel: much smaller/faster to install than the default
+# CUDA build and avoids hitting Streamlit Community Cloud's disk/RAM limits.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+
 langchain
 langchain-community
 langchain-text-splitters
@@ -5,6 +10,11 @@ langchain-google-genai
 langchain-chroma
 langchain-huggingface
 chromadb
+# Streamlit Community Cloud's base image ships an sqlite3 build too old for
+# chromadb. This wheel bundles a modern sqlite3 and is swapped in at import
+# time in rag_utils.py. Harmless/no-op on machines that already have a new
+# enough system sqlite3.
+pysqlite3-binary
 pypdf
 streamlit
 sentence-transformers

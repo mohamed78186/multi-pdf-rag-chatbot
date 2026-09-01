@@ -47,6 +47,56 @@ RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 DEFAULT_FETCH_K = 20
 DEFAULT_TOP_N = 6
 
+# Questions that ask for an enumeration ("list all X", "every Y") need many
+# more chunks than a narrow factual question, or items get silently dropped
+# because the reranker can only keep a handful of the highest-scoring chunks.
+# When one of these words appears, fetch_k/top_n are scaled up automatically.
+BROAD_QUERY_WORDS = [
+    "all",
+    "list",
+    "every",
+    "each",
+    "projects",
+    "skills",
+    "experience",
+    "experiences",
+    "education",
+    "certifications",
+    "certificates",
+    "courses",
+    "technologies",
+    "responsibilities",
+    "summarize",
+    "summary",
+    "overview",
+]
+
+BROAD_FETCH_K_MULTIPLIER = 2.0
+BROAD_TOP_N_MULTIPLIER = 2.5
+
+
+def is_broad_query(question: str) -> bool:
+    """Heuristic: does this question ask for an enumeration/full listing?"""
+    q = question.lower()
+    return any(word in q for word in BROAD_QUERY_WORDS)
+
+
+def resolve_retrieval_params(
+    question: str,
+    fetch_k: int = DEFAULT_FETCH_K,
+    top_n: int = DEFAULT_TOP_N,
+):
+    """
+    Scale fetch_k/top_n up for enumeration-style questions so that items
+    spread across many chunks (e.g. several CV projects) aren't truncated
+    by the reranker keeping only a small, narrowly "most relevant" set.
+    """
+    if is_broad_query(question):
+        fetch_k = max(fetch_k, int(fetch_k * BROAD_FETCH_K_MULTIPLIER))
+        top_n = max(top_n, int(top_n * BROAD_TOP_N_MULTIPLIER))
+
+    return fetch_k, top_n
+
 
 SYSTEM_PROMPT = """You are a precise research assistant. Answer the user's question
 using ONLY the context excerpts below, which were retrieved from the user's PDF

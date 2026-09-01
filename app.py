@@ -1,36 +1,35 @@
 """
-Streamlit UI - Multi-PDF RAG Chatbot
+Streamlit UI - Multi-PDF RAG Chatbot (Gemini edition)
+
+Run with:
+    streamlit run app.py
+
+Features:
+  - Upload multiple PDFs dynamically
+  - One shared ChromaDB collection across all uploaded PDFs
+  - Checkbox list to choose which PDFs to search
+  - Adjustable k
+  - Chat interface with conversation history
+  - Shows source filename + page number
 """
 
 import os
+import shutil
 import tempfile
 
 import streamlit as st
-from dotenv import load_dotenv
-
-# Loads GOOGLE_API_KEY (and anything else) from a local .env file if one
-# exists. Harmless no-op if the key is already set another way (shell env,
-# Streamlit Cloud secrets, etc.) - os.environ values set elsewhere are not
-# overwritten.
-load_dotenv()
 
 from rag_utils import (
-    DEFAULT_FETCH_K,
-    DEFAULT_TOP_N,
     ask,
-    build_hybrid_retriever,
     build_rag_chain,
     build_vectorstore,
     format_sources,
     get_embeddings,
     get_llm,
-    get_reranker,
-    is_broad_query,
+    get_retriever,
     load_pdfs,
-    resolve_retrieval_params,
     split_documents,
 )
-
 
 st.set_page_config(
     page_title="Multi-PDF RAG Chatbot",
@@ -38,27 +37,9 @@ st.set_page_config(
     layout="wide",
 )
 
-
-MAX_FILE_SIZE_MB = 10
-MAX_FILES = 3
-
-
-# Cache heavyweight resources across reruns/questions instead of reloading
-# the embedding model, the reranker, and the LLM client every single time.
-@st.cache_resource(show_spinner=False)
-def cached_get_embeddings():
-    return get_embeddings()
-
-
-@st.cache_resource(show_spinner=False)
-def cached_get_reranker():
-    return get_reranker()
-
-
-@st.cache_resource(show_spinner=False)
-def cached_get_llm():
-    return get_llm()
-
+# ---------------------------------------------------------------------------
+# Session state
+# ---------------------------------------------------------------------------
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -66,12 +47,18 @@ if "messages" not in st.session_state:
 if "vectordb" not in st.session_state:
     st.session_state.vectordb = None
 
-if "chunks" not in st.session_state:
-    st.session_state.chunks = []
-
 if "sources_available" not in st.session_state:
     st.session_state.sources_available = []
 
+if "persist_dir" not in st.session_state:
+    st.session_state.persist_dir = tempfile.mkdtemp(prefix="rag_chroma_")
+
+# Gemini only
+st.session_state.provider = "gemini"
+
+# ---------------------------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------------------------
 
 with st.sidebar:
     st.header("⚙️ Setup")
@@ -84,16 +71,15 @@ with st.sidebar:
     st.divider()
 
     uploaded_files = st.file_uploader(
-        "Upload PDF files",
+        "Upload one or more PDF files",
         type=["pdf"],
         accept_multiple_files=True,
-        help=f"Maximum {MAX_FILES} files, {MAX_FILE_SIZE_MB} MB each.",
     )
 
     chunk_size = st.slider(
         "Chunk size",
-        min_value=400,
-        max_value=1500,
+        min_value=200,
+        max_value=2000,
         value=800,
         step=100,
     )
@@ -101,34 +87,10 @@ with st.sidebar:
     chunk_overlap = st.slider(
         "Chunk overlap",
         min_value=0,
-        max_value=300,
-        value=80,
-        step=20,
+        max_value=500,
+        value=100,
+        step=50,
     )
-
-    with st.expander("🎯 Accuracy settings"):
-        top_n = st.slider(
-            "Chunks sent to the model (after reranking)",
-            min_value=3,
-            max_value=10,
-            value=DEFAULT_TOP_N,
-            help=(
-                "More chunks = more coverage but more chance of noise. "
-                "Fewer chunks = more focused, precise answers."
-            ),
-        )
-
-        fetch_k = st.slider(
-            "Candidates retrieved before reranking",
-            min_value=10,
-            max_value=40,
-            value=DEFAULT_FETCH_K,
-            step=5,
-            help=(
-                "How many chunks the hybrid (keyword + vector) search pulls "
-                "before the cross-encoder reranker narrows them down."
-            ),
-        )
 
     process_clicked = st.button(
         "🔄 Process PDFs",
@@ -138,17 +100,20 @@ with st.sidebar:
 
     st.divider()
 
+    k = st.slider(
+        "Retriever k (chunks to retrieve)",
+        min_value=1,
+        max_value=10,
+        value=4,
+    )
+
     if st.session_state.sources_available:
         st.subheader("📄 Search only these PDFs")
 
         selected_sources = []
 
         for src in st.session_state.sources_available:
-            if st.checkbox(
-                src,
-                value=True,
-                key=f"cb_{src}",
-            ):
+            if st.checkbox(src, value=True, key=f"cb_{src}"):
                 selected_sources.append(src)
 
     else:
@@ -161,12 +126,15 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
 
+# ---------------------------------------------------------------------------
+# Process PDFs
+# ---------------------------------------------------------------------------
 
 if process_clicked:
 
     if not os.environ.get("GOOGLE_API_KEY"):
         st.sidebar.error(
-            "Gemini API key is not configured."
+            "Gemini API key is not configured in Streamlit Secrets."
         )
 
     elif not uploaded_files:
@@ -174,105 +142,99 @@ if process_clicked:
             "Please upload at least one PDF."
         )
 
-    elif len(uploaded_files) > MAX_FILES:
-        st.sidebar.error(
-            f"Please upload at most {MAX_FILES} PDF files."
-        )
-
     else:
-        file_too_large = False
+        try:
+            with st.spinner(
+                "Loading, chunking, and embedding your PDF(s)..."
+            ):
+                tmp_dir = tempfile.mkdtemp(prefix="rag_uploads_")
 
-        for f in uploaded_files:
-            file_size_mb = len(f.getbuffer()) / (1024 * 1024)
+                saved_paths = []
 
-            if file_size_mb > MAX_FILE_SIZE_MB:
-                st.sidebar.error(
-                    f"{f.name} is too large. "
-                    f"Maximum allowed size is {MAX_FILE_SIZE_MB} MB."
-                )
-                file_too_large = True
-                break
+                for f in uploaded_files:
+                    path = os.path.join(tmp_dir, f.name)
 
-        if not file_too_large:
+                    with open(path, "wb") as out:
+                        out.write(f.getbuffer())
 
-            try:
-                with st.spinner(
-                    "Loading, chunking, and indexing your PDF(s)..."
-                ):
-                    tmp_dir = tempfile.mkdtemp(
-                        prefix="rag_uploads_"
-                    )
+                    saved_paths.append(path)
 
-                    saved_paths = []
+                # Load PDFs
+                docs = load_pdfs(saved_paths)
 
-                    for f in uploaded_files:
-                        path = os.path.join(
-                            tmp_dir,
-                            f.name,
-                        )
-
-                        with open(path, "wb") as out:
-                            out.write(f.getbuffer())
-
-                        saved_paths.append(path)
-
-                    docs = load_pdfs(saved_paths)
-
-                    chunks = split_documents(
-                        docs,
-                        chunk_size=chunk_size,
-                        chunk_overlap=chunk_overlap,
-                    )
-
-                    embeddings = cached_get_embeddings()
-
-                    vectordb = build_vectorstore(
-                        chunks,
-                        embeddings,
-                        collection_name="rag_collection_bge",
-                    )
-
-                    st.session_state.vectordb = vectordb
-                    st.session_state.chunks = chunks
-
-                    st.session_state.sources_available = sorted(
-                        {
-                            d.metadata["source"]
-                            for d in docs
-                        }
-                    )
-
-                    st.session_state.messages = []
-
-                st.sidebar.success(
-                    f"Indexed {len(chunks)} chunks from "
-                    f"{len(st.session_state.sources_available)} PDF(s)."
+                # Split into chunks
+                chunks = split_documents(
+                    docs,
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
                 )
 
-                st.rerun()
+                # Remove previous Chroma collection
+                if os.path.exists(st.session_state.persist_dir):
+                    shutil.rmtree(
+                        st.session_state.persist_dir,
+                        ignore_errors=True,
+                    )
 
-            except Exception as e:
-                st.error(
-                    f"Processing error: {str(e)}"
+                os.makedirs(
+                    st.session_state.persist_dir,
+                    exist_ok=True,
                 )
 
+                # Gemini embeddings
+                embeddings = get_embeddings(
+                    provider="gemini"
+                )
+
+                # Build vector store
+                vectordb = build_vectorstore(
+                    chunks,
+                    embeddings,
+                    persist_directory=st.session_state.persist_dir,
+                    collection_name="rag_collection_gemini",
+                )
+
+                st.session_state.vectordb = vectordb
+
+                st.session_state.sources_available = sorted(
+                    {
+                        d.metadata["source"]
+                        for d in docs
+                    }
+                )
+
+                st.session_state.messages = []
+
+            st.sidebar.success(
+                f"Indexed {len(chunks)} chunks from "
+                f"{len(st.session_state.sources_available)} PDF(s)."
+            )
+
+            st.rerun()
+
+        except Exception as e:
+            st.error(f"Error while processing PDFs: {e}")
+
+# ---------------------------------------------------------------------------
+# Main Chat Area
+# ---------------------------------------------------------------------------
 
 st.title("📚 Multi-PDF RAG Chatbot")
 
 st.caption(
-    "BGE Embeddings + BM25 Hybrid Search + Cross-Encoder Reranking + Gemini"
+    "LangChain + ChromaDB + Google Gemini"
 )
-
 
 if not st.session_state.vectordb:
 
     st.info(
-        "👈 Upload your PDF files and click "
-        "**Process PDFs** to get started."
+        "👈 Upload PDFs and click **Process PDFs** "
+        "in the sidebar to get started."
     )
 
 else:
 
+    # Show previous chat messages
     for msg in st.session_state.messages:
 
         with st.chat_message(msg["role"]):
@@ -283,6 +245,7 @@ else:
                 with st.expander("Sources"):
                     st.markdown(msg["sources"])
 
+    # User question
     question = st.chat_input(
         "Ask a question about your PDF(s)..."
     )
@@ -304,35 +267,22 @@ else:
             try:
                 with st.spinner("Thinking..."):
 
-                    effective_fetch_k, effective_top_n = resolve_retrieval_params(
-                        question,
-                        fetch_k=fetch_k,
-                        top_n=top_n,
-                    )
-
-                    if is_broad_query(question):
-                        st.caption(
-                            "🔎 Detected a broad/listing question — "
-                            "searching more thoroughly to avoid missing items."
-                        )
-
-                    retriever = build_hybrid_retriever(
+                    retriever = get_retriever(
                         st.session_state.vectordb,
-                        st.session_state.chunks,
-                        fetch_k=effective_fetch_k,
+                        k=k,
                         sources=selected_sources or None,
                     )
 
-                    reranker = cached_get_reranker()
-                    llm = cached_get_llm()
+                    llm = get_llm(
+                        provider="gemini"
+                    )
+
                     chain = build_rag_chain(llm)
 
                     answer, docs = ask(
                         retriever,
-                        reranker,
                         chain,
                         question,
-                        top_n=effective_top_n,
                     )
 
                     sources_md = format_sources(docs)
@@ -352,5 +302,5 @@ else:
 
             except Exception as e:
                 st.error(
-                    f"Error: {str(e)}"
+                    f"Error while generating answer: {e}"
                 )

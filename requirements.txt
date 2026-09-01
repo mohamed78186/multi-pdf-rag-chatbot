@@ -18,3 +18,6 @@ pysqlite3-binary
 pypdf
 streamlit
 sentence-transformers
+# BM25 keyword/sparse search, fused with vector search for hybrid retrieval
+# (see rag_utils.hybrid_pool). Pure-Python + numpy, no extra system deps.
+rank_bm25

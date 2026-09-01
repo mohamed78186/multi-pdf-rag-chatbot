@@ -351,19 +351,25 @@ def rerank(
     docs: List[Document],
     reranker: CrossEncoder,
     top_k: int = 4,
-    score_threshold: Optional[float] = None,
+    floor: Optional[float] = None,
+    margin: Optional[float] = None,
 ) -> List[Document]:
     """
     Re-scores each (query, chunk) pair with the cross-encoder and returns
-    the top_k most relevant chunks, best-first.
+    the most relevant chunks, best-first, capped at top_k.
 
-    Selection is by RANK (top_k), not by an absolute score cutoff -- see
-    _RERANK_FLOOR above for why. score_threshold, if given, is only used as
-    a minimum on the *best* chunk's raw score: if even the top match is
-    below it, the whole pool is treated as irrelevant and an empty list is
-    returned (this is what lets ask() correctly say "I don't know" when
-    nothing retrieved actually answers the question, without also
-    discarding weaker-but-still-correct chunks lower in a valid answer).
+    Two separate cutoffs, for two separate jobs:
+    - `floor` (defaults to _RERANK_FLOOR): if even the BEST chunk in the
+      pool scores below this, nothing in the pool is relevant at all --
+      return empty so ask() can say "I don't know".
+    - `margin`: once there IS a relevant top match, drop any chunk whose
+      score falls more than `margin` below that top score, before applying
+      top_k. This is what keeps a second, unrelated document (indexed in
+      the same session) from filling up the remaining top_k slots with
+      chunks that are merely "somewhat related" -- e.g. when a broad
+      question reranks the full pool across multiple PDFs, the wrong
+      document's best chunks are usually still well below the right
+      document's, and margin prunes them even though top_k alone would not.
     """
     if not docs:
         return []
@@ -377,9 +383,16 @@ def rerank(
         reverse=True,
     )
 
-    floor = _RERANK_FLOOR if score_threshold is None else score_threshold
+    floor = _RERANK_FLOOR if floor is None else floor
     if not scored or scored[0][1] < floor:
         return []
+
+    if margin is not None:
+        top_score = scored[0][1]
+        scored = [
+            (doc, score) for doc, score in scored
+            if score >= top_score - margin
+        ]
 
     return [doc for doc, _score in scored[:top_k]]
 
@@ -504,7 +517,8 @@ def ask(
     sources: Optional[List[str]] = None,
     pool_size: int = 20,
     final_k: int = 4,
-    score_threshold: Optional[float] = None,
+    floor: Optional[float] = None,
+    margin: Optional[float] = None,
     is_broad: bool = False,
 ):
     """
@@ -543,7 +557,8 @@ def ask(
             pool,
             reranker,
             top_k=final_k,
-            score_threshold=score_threshold,
+            floor=floor,
+            margin=margin,
         )
     else:
         docs = pool[:final_k]

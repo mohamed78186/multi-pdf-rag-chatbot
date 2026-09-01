@@ -8,7 +8,7 @@ PDFs
 -> Load
 -> Chunk
 -> BGE Embeddings
--> ChromaDB
+-> ChromaDB (in-memory)
 -> Adaptive Retriever (MMR)
 -> Gemini
 -> Answer + Sources
@@ -98,7 +98,7 @@ def load_pdfs(pdf_paths: Sequence[str]) -> List[Document]:
 
 def split_documents(
     docs: List[Document],
-    chunk_size: int = 700,
+    chunk_size: int = 800,
     chunk_overlap: int = 80,
 ) -> List[Document]:
 
@@ -114,14 +114,19 @@ def split_documents(
 def build_vectorstore(
     chunks: List[Document],
     embeddings,
-    persist_directory: str,
+    persist_directory=None,
     collection_name: str = "rag_collection",
 ) -> Chroma:
+    """
+    In-memory ChromaDB.
+
+    No persist_directory is used, so Streamlit Cloud does not need
+    to write to a local SQLite database.
+    """
 
     vectordb = Chroma(
         collection_name=collection_name,
         embedding_function=embeddings,
-        persist_directory=persist_directory,
     )
 
     vectordb.add_documents(chunks)
@@ -169,7 +174,6 @@ def _format_docs(docs: List[Document]) -> str:
 
 
 def build_rag_chain(llm: ChatGoogleGenerativeAI):
-
     prompt = ChatPromptTemplate.from_messages(
         [
             ("system", SYSTEM_PROMPT),
@@ -223,7 +227,6 @@ def _invoke_chain_with_retry(
             return chain.invoke(inputs)
 
         except Exception as e:
-
             if not _is_rate_limit_error(e):
                 raise
 

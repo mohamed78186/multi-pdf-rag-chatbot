@@ -1,23 +1,35 @@
 """
 rag_utils.py
 ------------
-Multi-PDF RAG using BGE embeddings + ChromaDB + Gemini.
+Multi-PDF RAG using BGE embeddings + ChromaDB + BM25 + Cross-Encoder rerank + Gemini.
 
 Pipeline:
 PDFs
 -> Load
--> Chunk
--> BGE Embeddings
--> ChromaDB (in-memory)
--> Adaptive Retriever (MMR)
--> Gemini
+-> Chunk (each chunk gets a stable chunk_id)
+-> BGE Embeddings -> ChromaDB (in-memory, dense/semantic search)
+-> BM25 index (sparse/keyword search, same chunk_id space)
+-> Hybrid fusion (Reciprocal Rank Fusion of the two rankings)
+-> Cross-Encoder reranker (precise relevance scoring of the fused pool)
+-> Score-threshold cut -> Gemini
 -> Answer + Sources
+
+Hybrid search matters because dense embeddings are good at "meaning" but can
+miss exact keyword/number/name matches (e.g. an ID, a rare term, an acronym);
+BM25 is good at exact keyword matches but blind to paraphrasing. Fusing both
+rankings (instead of picking one) recovers the correct chunk in more cases
+than either alone. The cross-encoder reranker then re-scores that fused
+pool with a much more accurate (but slower) query<->chunk relevance model
+than raw embedding cosine similarity, which is what actually improves
+precision -- it is the single biggest lever for cutting down wrong/irrelevant
+context reaching the LLM.
 """
 
+import math
 import os
 import re
 import time
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 # Streamlit Community Cloud ships an old system sqlite3 (< 3.35) which
 # chromadb refuses to run on. Swap in the pysqlite3-binary wheel (see
@@ -38,10 +50,22 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_huggingface import HuggingFaceEmbeddings
+from rank_bm25 import BM25Okapi
+from sentence_transformers import CrossEncoder
 
 
 CHAT_MODEL = "gemini-3.5-flash-lite"
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+
+# Small, fast, CPU-friendly cross-encoder. It only has to re-score a handful
+# of already-retrieved chunks per question, so latency stays low even on
+# Streamlit Community Cloud's shared CPUs.
+RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+# Reciprocal Rank Fusion constant. 60 is the standard value from the
+# original RRF paper; it just controls how quickly rank position decays --
+# not sensitive enough to need tuning here.
+RRF_K = 60
 
 
 SYSTEM_PROMPT = """You are a precise document-QA assistant. Answer using ONLY the
@@ -104,6 +128,20 @@ def get_llm(
     )
 
 
+def get_reranker() -> CrossEncoder:
+    """
+    Cross-encoder used to re-score the hybrid (BM25 + vector) candidate pool.
+
+    Unlike embedding cosine similarity (which scores query and chunk
+    independently, then compares vectors), a cross-encoder reads the query
+    and the chunk together in one forward pass, so it captures actual
+    query<->chunk relevance far more accurately. It's slower per pair, which
+    is exactly why it only runs on the small fused candidate pool rather
+    than the whole collection.
+    """
+    return CrossEncoder(RERANKER_MODEL, max_length=512)
+
+
 def load_pdfs(pdf_paths: Sequence[str]) -> List[Document]:
     all_docs: List[Document] = []
 
@@ -133,7 +171,15 @@ def split_documents(
         separators=["\n\n", "\n", ". ", " ", ""],
     )
 
-    return splitter.split_documents(docs)
+    chunks = splitter.split_documents(docs)
+
+    # A stable, 0-indexed chunk_id shared by the vector store and the BM25
+    # index is what lets hybrid_pool() fuse the two rankings by identity
+    # instead of by (fragile) text matching.
+    for i, c in enumerate(chunks):
+        c.metadata["chunk_id"] = i
+
+    return chunks
 
 
 def build_vectorstore(
@@ -150,10 +196,9 @@ def build_vectorstore(
 
     collection_metadata forces cosine distance explicitly (Chroma's
     default is L2). BGE embeddings are normalized specifically for
-    cosine similarity (see get_embeddings), and get_retriever's manual
-    score-threshold filtering assumes a 0-1, higher-is-better cosine
-    relevance score — so this must stay set for that filtering to be
-    meaningful.
+    cosine similarity (see get_embeddings), and hybrid_pool()'s vector
+    leg assumes a 0-1, higher-is-better cosine relevance score -- so
+    this must stay set for that to be meaningful.
     """
 
     vectordb = Chroma(
@@ -167,97 +212,159 @@ def build_vectorstore(
     return vectordb
 
 
-class _ScoreThresholdRetriever:
+_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+
+
+def _tokenize(text: str) -> List[str]:
+    # \w+ with re.UNICODE covers Arabic and other non-Latin scripts too;
+    # .lower() is a safe no-op on scripts without case.
+    return _TOKEN_RE.findall(text.lower())
+
+
+class BM25Index:
     """
-    Minimal drop-in replacement for
-    vectordb.as_retriever(search_type="similarity_score_threshold", ...).
-
-    That built-in LangChain search_type has known cross-version
-    reliability issues (a pydantic validation error on some
-    langchain-core versions even when score_threshold is a valid
-    float). Filtering by score ourselves, directly against
-    similarity_search_with_relevance_scores, sidesteps that entirely
-    and is easier to reason about/debug.
+    Thin wrapper around rank_bm25's BM25Okapi that keeps the chunk list
+    alongside the index, so callers never have to juggle the two
+    separately. Index position == chunk_id (see split_documents).
     """
 
-    def __init__(self, vectordb: Chroma, k: int, score_threshold: float, filter_dict=None):
-        self.vectordb = vectordb
-        self.k = k
-        self.score_threshold = score_threshold
-        self.filter_dict = filter_dict
+    def __init__(self, chunks: List[Document]):
+        self.chunks = chunks
+        tokenized_corpus = [_tokenize(c.page_content) for c in chunks]
+        self._bm25 = BM25Okapi(tokenized_corpus)
 
-    def invoke(self, query: str) -> List[Document]:
-        kwargs = {}
-        if self.filter_dict:
-            kwargs["filter"] = self.filter_dict
+    def top_k(
+        self,
+        query: str,
+        k: int,
+        allowed_sources: Optional[List[str]] = None,
+    ) -> List[Tuple[int, float]]:
+        """Returns [(chunk_id, bm25_score), ...] sorted best-first."""
+        scores = self._bm25.get_scores(_tokenize(query))
 
-        results = self.vectordb.similarity_search_with_relevance_scores(
-            query,
-            k=self.k,
-            **kwargs,
-        )
+        candidate_ids = range(len(self.chunks))
+        if allowed_sources:
+            allowed = set(allowed_sources)
+            candidate_ids = [
+                i for i in candidate_ids
+                if self.chunks[i].metadata.get("source") in allowed
+            ]
 
-        return [
-            doc
-            for doc, score in results
-            if score >= self.score_threshold
-        ]
+        ranked = sorted(
+            candidate_ids,
+            key=lambda i: scores[i],
+            reverse=True,
+        )[:k]
+
+        return [(i, float(scores[i])) for i in ranked]
 
 
-def get_retriever(
+def build_bm25_index(chunks: List[Document]) -> BM25Index:
+    return BM25Index(chunks)
+
+
+def hybrid_pool(
     vectordb: Chroma,
-    k: int = 4,
+    bm25_index: BM25Index,
+    query: str,
+    k_vector: int = 20,
+    k_bm25: int = 20,
     sources: Optional[List[str]] = None,
-    search_type: str = "similarity_score_threshold",
-    score_threshold: float = 0.45,
-):
+) -> List[Document]:
     """
-    Defaults to similarity search with a minimum relevance score: for
-    factual Q&A, pulling the top-k *most relevant* chunks (and dropping
-    anything below `score_threshold`) is more accurate than MMR, which
-    deliberately trades relevance for diversity and can drop a chunk
-    that repeats (but confirms) the right answer.
+    Runs dense (vector/semantic) search and sparse (BM25/keyword) search
+    independently, then fuses the two rankings with Reciprocal Rank Fusion
+    (RRF): a document's fused score is the sum of 1/(RRF_K + rank) across
+    whichever of the two lists it appears in.
 
-    The score threshold matters most when several unrelated PDFs are
-    indexed together (e.g. a CV + an unrelated slide deck): without it,
-    a "give me everything" style question can pull in chunks from a
-    completely different document just to fill up k, polluting both the
-    answer's context and the Sources list. score_threshold=0.45 (cosine
-    similarity, since embeddings are normalized and the collection uses
-    cosine distance — see build_vectorstore) is a reasonable default;
-    raise it (e.g. 0.6) to be stricter, lower it if relevant chunks are
-    being dropped for a large/varied document.
+    RRF is used instead of e.g. averaging raw scores because cosine
+    similarity and BM25 scores live on completely different, uncomparable
+    scales -- RRF only needs each ranking's *order*, not its scores, so
+    there's nothing to normalize or tune per collection.
 
-    Pass search_type="mmr" if you specifically want broader, less
-    redundant coverage across ONE topic (e.g. very open-ended
-    "summarize everything in this document" style questions).
+    Returns documents sorted best-first; this is a *candidate pool*, not
+    the final answer context -- rerank() below narrows it down.
     """
     filter_dict = {"source": {"$in": sources}} if sources else None
 
-    if search_type == "similarity_score_threshold":
-        return _ScoreThresholdRetriever(
-            vectordb,
-            k=k,
-            score_threshold=score_threshold,
-            filter_dict=filter_dict,
-        )
-
-    if search_type == "mmr":
-        search_kwargs = {
-            "k": k,
-            "fetch_k": max(k * 3, 15),
-            "lambda_mult": 0.5,
-        }
-    else:
-        search_kwargs = {"k": k}
-
-    if filter_dict:
-        search_kwargs["filter"] = filter_dict
-
-    return vectordb.as_retriever(
-        search_type=search_type,
-        search_kwargs=search_kwargs,
+    vector_results = vectordb.similarity_search_with_relevance_scores(
+        query,
+        k=k_vector,
+        **({"filter": filter_dict} if filter_dict else {}),
     )
+    vector_ranks: Dict[int, int] = {
+        doc.metadata["chunk_id"]: rank
+        for rank, (doc, _score) in enumerate(vector_results)
+    }
+    chunk_lookup: Dict[int, Document] = {
+        doc.metadata["chunk_id"]: doc for doc, _score in vector_results
+    }
+
+    bm25_results = bm25_index.top_k(query, k=k_bm25, allowed_sources=sources)
+    bm25_ranks: Dict[int, int] = {
+        chunk_id: rank for rank, (chunk_id, _score) in enumerate(bm25_results)
+    }
+    for chunk_id, _score in bm25_results:
+        chunk_lookup.setdefault(chunk_id, bm25_index.chunks[chunk_id])
+
+    all_ids = set(vector_ranks) | set(bm25_ranks)
+
+    fused_scores = {}
+    for chunk_id in all_ids:
+        score = 0.0
+        if chunk_id in vector_ranks:
+            score += 1.0 / (RRF_K + vector_ranks[chunk_id] + 1)
+        if chunk_id in bm25_ranks:
+            score += 1.0 / (RRF_K + bm25_ranks[chunk_id] + 1)
+        fused_scores[chunk_id] = score
+
+    ranked_ids = sorted(all_ids, key=lambda i: fused_scores[i], reverse=True)
+
+    return [chunk_lookup[i] for i in ranked_ids]
+
+
+def _sigmoid(x: float) -> float:
+    return 1.0 / (1.0 + math.exp(-x))
+
+
+def rerank(
+    query: str,
+    docs: List[Document],
+    reranker: CrossEncoder,
+    top_k: int = 4,
+    score_threshold: Optional[float] = None,
+) -> List[Document]:
+    """
+    Re-scores each (query, chunk) pair with the cross-encoder and returns
+    the top_k most relevant chunks, best-first.
+
+    score_threshold, if given, is applied to the sigmoid-normalized (0-1)
+    cross-encoder score and drops chunks the reranker itself considers not
+    actually relevant -- this is what lets a hybrid search hit that only
+    matched on a stray keyword get filtered back out instead of polluting
+    the answer, and is what allows ask() to correctly say "I don't know"
+    when nothing in the pool is genuinely relevant.
+    """
+    if not docs:
+        return []
+
+    pairs = [(query, d.page_content) for d in docs]
+    raw_scores = reranker.predict(pairs)
+
+    scored = sorted(
+        zip(docs, raw_scores),
+        key=lambda pair: pair[1],
+        reverse=True,
+    )
+
+    if score_threshold is not None:
+        scored = [
+            (doc, score)
+            for doc, score in scored
+            if _sigmoid(score) >= score_threshold
+        ]
+
+    return [doc for doc, _score in scored[:top_k]]
 
 
 def _display_page(page) -> str:
@@ -363,11 +470,44 @@ def _invoke_chain_with_retry(
 
 
 def ask(
-    retriever,
+    vectordb: Chroma,
+    bm25_index: BM25Index,
     chain,
     question: str,
+    reranker: Optional[CrossEncoder] = None,
+    sources: Optional[List[str]] = None,
+    pool_size: int = 20,
+    final_k: int = 4,
+    score_threshold: Optional[float] = 0.3,
 ):
-    docs = retriever.invoke(question)
+    """
+    Full retrieval pipeline for one question:
+    hybrid_pool() (BM25 + vector, fused via RRF) -> rerank() (cross-encoder,
+    score-threshold cut) -> LLM.
+
+    If `reranker` is omitted, falls back to using the hybrid pool's own
+    fused order (still hybrid search, just without the precision boost
+    from cross-encoder reranking).
+    """
+    pool = hybrid_pool(
+        vectordb,
+        bm25_index,
+        question,
+        k_vector=pool_size,
+        k_bm25=pool_size,
+        sources=sources,
+    )
+
+    if reranker is not None:
+        docs = rerank(
+            question,
+            pool,
+            reranker,
+            top_k=final_k,
+            score_threshold=score_threshold,
+        )
+    else:
+        docs = pool[:final_k]
 
     if not docs:
         return (

@@ -52,12 +52,8 @@ if "persist_dir" not in st.session_state:
 with st.sidebar:
     st.header("⚙️ Setup")
 
-    provider = st.radio(
-        "Model provider",
-        options=["Gemini (cloud)", "Ollama (local)"],
-        horizontal=True,
-    )
-    st.session_state.provider = "gemini" if provider.startswith("Gemini") else "ollama"
+    st.session_state.provider = "gemini"
+    st.success("Using Gemini API")
 
     if st.session_state.provider == "gemini":
         api_key_input = st.text_input(
@@ -68,19 +64,7 @@ with st.sidebar:
         )
         if api_key_input:
             get_api_key(api_key_input)
-    else:
-        st.text_input(
-            "Ollama chat model",
-            value=os.environ.get("OLLAMA_CHAT_MODEL", "llama3.2"),
-            key="ollama_chat_model",
-            help="Must already be pulled: `ollama pull llama3.2`",
-        )
-        st.text_input(
-            "Ollama embedding model",
-            value=os.environ.get("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text"),
-            key="ollama_embed_model",
-            help="Must already be pulled: `ollama pull nomic-embed-text`",
-        )
+   
         st.caption("Requires `ollama serve` running locally.")
         os.environ["OLLAMA_CHAT_MODEL"] = st.session_state.ollama_chat_model
         os.environ["OLLAMA_EMBEDDING_MODEL"] = st.session_state.ollama_embed_model

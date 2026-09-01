@@ -10,3 +10,4 @@ pypdf
 streamlit
 sentence-transformers
 rank_bm25
+python-dotenv

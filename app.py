@@ -332,13 +332,22 @@ else:
                     # relevant bullet point can't be missed just because it
                     # didn't score in retrieval's initial cut. Specific
                     # factual questions use a tighter, top-k-based pool.
-                    # Either way, chunk selection is rank-based (top_k
-                    # after cross-encoder reranking), not an absolute score
-                    # cutoff -- see rag_utils.rerank() -- so relevant
-                    # chunks aren't silently dropped by a miscalibrated
-                    # threshold, while an unrelated document loaded in the
-                    # same session still can't get pulled in just to fill k.
+                    #
+                    # Either way, final selection in rerank() is:
+                    # (1) rank-based (top_k), not an absolute score cutoff,
+                    #     so a relevant chunk isn't dropped by a
+                    #     miscalibrated threshold, and
+                    # (2) margin-based: only chunks within `margin` of the
+                    #     TOP chunk's score survive. This is what actually
+                    #     keeps a second, unrelated PDF loaded in the same
+                    #     session out of the Sources list for a broad
+                    #     question -- top_k alone would still fill its
+                    #     remaining slots with that document's
+                    #     "somewhat related" chunks; margin prunes them
+                    #     because they score well below the right
+                    #     document's chunks.
                     final_k = 10 if is_broad else 4
+                    margin = 4.0 if is_broad else 2.5
                     pool_size = max(final_k * 4, 15)
 
                     llm = get_cached_llm()
@@ -355,6 +364,7 @@ else:
                         sources=selected_sources or None,
                         pool_size=pool_size,
                         final_k=final_k,
+                        margin=margin,
                         is_broad=is_broad,
                     )
 

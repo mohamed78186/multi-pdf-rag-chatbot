@@ -306,21 +306,23 @@ else:
                         for word in broad_words
                     )
 
-                    # Broad/"list everything" questions get a higher k and a
-                    # slightly lower relevance bar (they may need more chunks
-                    # from the SAME document to be complete); specific
-                    # factual questions get a tighter, more precise search.
-                    # Both paths go through the same relevance-score filter
-                    # (see get_retriever/_ScoreThresholdRetriever) so an
-                    # unrelated document loaded in the same session never
-                    # gets pulled in just to fill up k.
-                    dynamic_k = 8 if is_broad else 4
-                    dynamic_threshold = 0.35 if is_broad else 0.45
+                    # Broad/"list everything" questions get a higher
+                    # per-source k and a slightly lower relevance bar
+                    # (they may need several chunks from the SAME document
+                    # to be complete); specific factual questions get a
+                    # tighter, more precise search. get_retriever fans
+                    # retrieval out per-document (via all_sources) so one
+                    # document's chunks never crowd another's out of the
+                    # results, and the relevance threshold still keeps an
+                    # unrelated document from being pulled in for no reason.
+                    dynamic_k = 6 if is_broad else 4
+                    dynamic_threshold = 0.3 if is_broad else 0.4
 
                     retriever = get_retriever(
                         st.session_state.vectordb,
                         k=dynamic_k,
                         sources=selected_sources or None,
+                        all_sources=st.session_state.sources_available,
                         search_type="similarity_score_threshold",
                         score_threshold=dynamic_threshold,
                     )

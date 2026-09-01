@@ -75,8 +75,17 @@ more than completeness or fluency.
 Rules:
 - Answer strictly using the given context. Never use outside knowledge, never guess,
   and never fill gaps with something that "sounds right."
-- If the answer is not contained in the context, reply exactly with:
+- If the context contains ANYTHING relevant to the question, even if partial or
+  loosely related (e.g. training, courses, or programs when asked about
+  "certifications"), answer with that instead of refusing. Only use the fallback
+  sentence below when the context has NOTHING relevant at all.
+- If the answer is not contained in the context at all, reply with ONLY this
+  sentence and nothing else added before or after it:
   "I don't know based on the provided document(s)."
+- Never combine that fallback sentence with any other explanation in the same
+  answer -- if you can say anything useful from the context, say that instead of
+  the fallback sentence, and note what's missing in plain prose (not the fixed
+  sentence).
 - If the context only partially answers the question, answer only the supported part
   and explicitly say which part is missing rather than inferring it.
 - Copy numbers, dates, names, and figures EXACTLY as written in the context. Do not
@@ -327,6 +336,16 @@ def _sigmoid(x: float) -> float:
     return 1.0 / (1.0 + math.exp(-x))
 
 
+# ms-marco-MiniLM-L-6-v2's raw logits are NOT a calibrated 0-1 probability --
+# a genuinely relevant chunk can score well below 0 in raw terms, so a fixed
+# absolute cutoff (even after sigmoid) ends up rejecting correct chunks as
+# often as it rejects wrong ones. -8 is a "this pair is essentially
+# unrelated" floor observed empirically for this model, used only to catch
+# the case where NOTHING in the pool is relevant -- not to filter the
+# ranked list itself (top_k already does that).
+_RERANK_FLOOR = -8.0
+
+
 def rerank(
     query: str,
     docs: List[Document],
@@ -338,12 +357,13 @@ def rerank(
     Re-scores each (query, chunk) pair with the cross-encoder and returns
     the top_k most relevant chunks, best-first.
 
-    score_threshold, if given, is applied to the sigmoid-normalized (0-1)
-    cross-encoder score and drops chunks the reranker itself considers not
-    actually relevant -- this is what lets a hybrid search hit that only
-    matched on a stray keyword get filtered back out instead of polluting
-    the answer, and is what allows ask() to correctly say "I don't know"
-    when nothing in the pool is genuinely relevant.
+    Selection is by RANK (top_k), not by an absolute score cutoff -- see
+    _RERANK_FLOOR above for why. score_threshold, if given, is only used as
+    a minimum on the *best* chunk's raw score: if even the top match is
+    below it, the whole pool is treated as irrelevant and an empty list is
+    returned (this is what lets ask() correctly say "I don't know" when
+    nothing retrieved actually answers the question, without also
+    discarding weaker-but-still-correct chunks lower in a valid answer).
     """
     if not docs:
         return []
@@ -357,12 +377,9 @@ def rerank(
         reverse=True,
     )
 
-    if score_threshold is not None:
-        scored = [
-            (doc, score)
-            for doc, score in scored
-            if _sigmoid(score) >= score_threshold
-        ]
+    floor = _RERANK_FLOOR if score_threshold is None else score_threshold
+    if not scored or scored[0][1] < floor:
+        return []
 
     return [doc for doc, _score in scored[:top_k]]
 
@@ -469,6 +486,15 @@ def _invoke_chain_with_retry(
     )
 
 
+# Above this many chunks, "give me everything" questions still go through
+# retrieval (a full scan would be too much context/too slow). At or below
+# it -- a typical single CV/short document -- broad questions instead skip
+# retrieval entirely and rerank the WHOLE indexed set, so nothing (a
+# project bullet, a certification line) can get missed just because it
+# didn't score in retrieval's initial top-k.
+FULL_POOL_CHUNK_LIMIT = 60
+
+
 def ask(
     vectordb: Chroma,
     bm25_index: BM25Index,
@@ -478,25 +504,38 @@ def ask(
     sources: Optional[List[str]] = None,
     pool_size: int = 20,
     final_k: int = 4,
-    score_threshold: Optional[float] = 0.3,
+    score_threshold: Optional[float] = None,
+    is_broad: bool = False,
 ):
     """
     Full retrieval pipeline for one question:
     hybrid_pool() (BM25 + vector, fused via RRF) -> rerank() (cross-encoder,
-    score-threshold cut) -> LLM.
+    rank-based cut, see rerank()) -> LLM.
 
     If `reranker` is omitted, falls back to using the hybrid pool's own
     fused order (still hybrid search, just without the precision boost
     from cross-encoder reranking).
     """
-    pool = hybrid_pool(
-        vectordb,
-        bm25_index,
-        question,
-        k_vector=pool_size,
-        k_bm25=pool_size,
-        sources=sources,
-    )
+    candidate_chunks = [
+        c for c in bm25_index.chunks
+        if not sources or c.metadata.get("source") in sources
+    ]
+
+    if is_broad and len(candidate_chunks) <= FULL_POOL_CHUNK_LIMIT:
+        # Small document(s) + a "list/summarize/compare everything" style
+        # question: retrieval's top-k can legitimately miss a relevant
+        # chunk (e.g. a second, differently-worded project bullet), so
+        # just rerank the entire indexed set for these sources instead.
+        pool = candidate_chunks
+    else:
+        pool = hybrid_pool(
+            vectordb,
+            bm25_index,
+            question,
+            k_vector=pool_size,
+            k_bm25=pool_size,
+            sources=sources,
+        )
 
     if reranker is not None:
         docs = rerank(

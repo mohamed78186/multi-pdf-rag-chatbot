@@ -9,7 +9,7 @@ PDFs
 -> Chunk
 -> BGE Embeddings
 -> ChromaDB
--> Retriever
+-> Adaptive Retriever (MMR)
 -> Gemini
 -> Answer + Sources
 """
@@ -29,12 +29,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_huggingface import HuggingFaceEmbeddings
 
 
-# ---------------------------------------------------------------------------
-# Models
-# ---------------------------------------------------------------------------
-
 CHAT_MODEL = "gemini-3.5-flash-lite"
-
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 
 
@@ -56,10 +51,6 @@ Context:
 """
 
 
-# ---------------------------------------------------------------------------
-# API key
-# ---------------------------------------------------------------------------
-
 def get_api_key(explicit_key: Optional[str] = None) -> str:
     key = explicit_key or os.environ.get("GOOGLE_API_KEY")
 
@@ -70,30 +61,13 @@ def get_api_key(explicit_key: Optional[str] = None) -> str:
     return key
 
 
-# ---------------------------------------------------------------------------
-# Embeddings
-# ---------------------------------------------------------------------------
-
 def get_embeddings(provider: Optional[str] = None):
-    """
-    Local BGE embeddings.
-    No Gemini embedding quota is used.
-    """
-
     return HuggingFaceEmbeddings(
         model_name=EMBEDDING_MODEL,
-        model_kwargs={
-            "device": "cpu"
-        },
-        encode_kwargs={
-            "normalize_embeddings": True
-        },
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True},
     )
 
-
-# ---------------------------------------------------------------------------
-# Gemini LLM
-# ---------------------------------------------------------------------------
 
 def get_llm(
     temperature: float = 0.0,
@@ -104,10 +78,6 @@ def get_llm(
         temperature=temperature,
     )
 
-
-# ---------------------------------------------------------------------------
-# PDF loading
-# ---------------------------------------------------------------------------
 
 def load_pdfs(pdf_paths: Sequence[str]) -> List[Document]:
     all_docs: List[Document] = []
@@ -126,10 +96,6 @@ def load_pdfs(pdf_paths: Sequence[str]) -> List[Document]:
     return all_docs
 
 
-# ---------------------------------------------------------------------------
-# Chunking
-# ---------------------------------------------------------------------------
-
 def split_documents(
     docs: List[Document],
     chunk_size: int = 700,
@@ -144,10 +110,6 @@ def split_documents(
 
     return splitter.split_documents(docs)
 
-
-# ---------------------------------------------------------------------------
-# Vector store
-# ---------------------------------------------------------------------------
 
 def build_vectorstore(
     chunks: List[Document],
@@ -167,19 +129,15 @@ def build_vectorstore(
     return vectordb
 
 
-# ---------------------------------------------------------------------------
-# Retriever
-# ---------------------------------------------------------------------------
-
 def get_retriever(
     vectordb: Chroma,
     k: int = 3,
     sources: Optional[List[str]] = None,
-    score_threshold: Optional[float] = None,
 ):
-
     search_kwargs = {
-        "k": k
+        "k": k,
+        "fetch_k": max(k * 3, 15),
+        "lambda_mult": 0.7,
     }
 
     if sources:
@@ -189,22 +147,11 @@ def get_retriever(
             }
         }
 
-    if score_threshold is not None:
-        search_kwargs["score_threshold"] = score_threshold
-
-        return vectordb.as_retriever(
-            search_type="similarity_score_threshold",
-            search_kwargs=search_kwargs,
-        )
-
     return vectordb.as_retriever(
-        search_kwargs=search_kwargs
+        search_type="mmr",
+        search_kwargs=search_kwargs,
     )
 
-
-# ---------------------------------------------------------------------------
-# Format docs
-# ---------------------------------------------------------------------------
 
 def _format_docs(docs: List[Document]) -> str:
     parts = []
@@ -221,10 +168,6 @@ def _format_docs(docs: List[Document]) -> str:
     return "\n\n---\n\n".join(parts)
 
 
-# ---------------------------------------------------------------------------
-# RAG chain
-# ---------------------------------------------------------------------------
-
 def build_rag_chain(llm: ChatGoogleGenerativeAI):
 
     prompt = ChatPromptTemplate.from_messages(
@@ -236,10 +179,6 @@ def build_rag_chain(llm: ChatGoogleGenerativeAI):
 
     return prompt | llm | StrOutputParser()
 
-
-# ---------------------------------------------------------------------------
-# Gemini rate limit handling
-# ---------------------------------------------------------------------------
 
 def _extract_retry_delay(
     error_text: str,
@@ -299,7 +238,6 @@ def _invoke_chain_with_retry(
             )
 
             time.sleep(wait_time)
-
             delay = min(delay * 2, 60)
 
     raise RuntimeError(
@@ -307,16 +245,11 @@ def _invoke_chain_with_retry(
     )
 
 
-# ---------------------------------------------------------------------------
-# Ask
-# ---------------------------------------------------------------------------
-
 def ask(
     retriever,
     chain,
     question: str,
 ):
-
     docs = retriever.invoke(question)
 
     if not docs:
@@ -338,12 +271,7 @@ def ask(
     return answer, docs
 
 
-# ---------------------------------------------------------------------------
-# Sources
-# ---------------------------------------------------------------------------
-
 def format_sources(docs: List[Document]) -> str:
-
     seen = set()
     lines = []
 

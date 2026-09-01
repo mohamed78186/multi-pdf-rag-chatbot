@@ -204,12 +204,76 @@ class _ScoreThresholdRetriever:
         ]
 
 
+class _MultiSourceRetriever:
+    """
+    Runs a separate, independent similarity search PER document and
+    merges the results, instead of one shared top-k search across every
+    indexed document.
+
+    Why: with a single shared top-k, documents compete for the same k
+    slots. If an unrelated PDF (e.g. a slide deck) happens to have a
+    chunk that scores marginally higher for a given query than a
+    genuinely relevant chunk in the target document (e.g. a CV), the
+    relevant chunk gets silently pushed out of the top-k — even though
+    it easily clears the relevance threshold on its own. That produces
+    incomplete answers (e.g. 2 of 4 listed projects) with no error or
+    warning. Searching each document independently guarantees one
+    document's chunks can never starve another's out of the results.
+    """
+
+    def __init__(
+        self,
+        vectordb: Chroma,
+        target_sources: List[str],
+        k_per_source: int,
+        score_threshold: float,
+    ):
+        self.vectordb = vectordb
+        self.target_sources = target_sources
+        self.k_per_source = k_per_source
+        self.score_threshold = score_threshold
+
+    def invoke(self, query: str) -> List[Document]:
+        scored_docs = []
+        seen = set()
+
+        for src in self.target_sources:
+            results = self.vectordb.similarity_search_with_relevance_scores(
+                query,
+                k=self.k_per_source,
+                filter={"source": {"$in": [src]}},
+            )
+
+            for doc, score in results:
+                if score < self.score_threshold:
+                    continue
+
+                key = (
+                    doc.metadata.get("source"),
+                    doc.metadata.get("page"),
+                    doc.page_content[:80],
+                )
+
+                if key in seen:
+                    continue
+
+                seen.add(key)
+                scored_docs.append((doc, score))
+
+        # Best-matching chunks first, regardless of which document they
+        # came from.
+        scored_docs.sort(key=lambda pair: pair[1], reverse=True)
+
+        return [doc for doc, _ in scored_docs]
+
+
 def get_retriever(
     vectordb: Chroma,
     k: int = 4,
     sources: Optional[List[str]] = None,
     search_type: str = "similarity_score_threshold",
-    score_threshold: float = 0.45,
+    score_threshold: float = 0.4,
+    all_sources: Optional[List[str]] = None,
 ):
     """
     Defaults to similarity search with a minimum relevance score: for
@@ -218,23 +282,37 @@ def get_retriever(
     deliberately trades relevance for diversity and can drop a chunk
     that repeats (but confirms) the right answer.
 
-    The score threshold matters most when several unrelated PDFs are
-    indexed together (e.g. a CV + an unrelated slide deck): without it,
-    a "give me everything" style question can pull in chunks from a
-    completely different document just to fill up k, polluting both the
-    answer's context and the Sources list. score_threshold=0.45 (cosine
-    similarity, since embeddings are normalized and the collection uses
-    cosine distance — see build_vectorstore) is a reasonable default;
-    raise it (e.g. 0.6) to be stricter, lower it if relevant chunks are
-    being dropped for a large/varied document.
+    `all_sources` should be every document name currently indexed in
+    `vectordb` (e.g. st.session_state.sources_available). Whenever more
+    than one document is in play — either because the user explicitly
+    selected several via the sidebar checkboxes, or because no filter
+    was applied and `all_sources` has more than one entry — retrieval
+    is fanned out per-document (see _MultiSourceRetriever) so documents
+    never compete with each other for the same top-k slots. With a
+    single document, this is equivalent to (and as fast as) a plain
+    top-k similarity search.
+
+    score_threshold=0.4 (cosine similarity, since embeddings are
+    normalized and the collection uses cosine distance — see
+    build_vectorstore) is a reasonable default; raise it (e.g. 0.6) to
+    be stricter, lower it if relevant chunks are being dropped.
 
     Pass search_type="mmr" if you specifically want broader, less
-    redundant coverage across ONE topic (e.g. very open-ended
-    "summarize everything in this document" style questions).
+    redundant coverage within a single already-filtered document.
     """
     filter_dict = {"source": {"$in": sources}} if sources else None
 
     if search_type == "similarity_score_threshold":
+        target_sources = sources or all_sources
+
+        if target_sources and len(target_sources) > 1:
+            return _MultiSourceRetriever(
+                vectordb,
+                target_sources=target_sources,
+                k_per_source=k,
+                score_threshold=score_threshold,
+            )
+
         return _ScoreThresholdRetriever(
             vectordb,
             k=k,

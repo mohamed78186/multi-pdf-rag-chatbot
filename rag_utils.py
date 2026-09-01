@@ -8,8 +8,8 @@ PDFs
 -> Load
 -> Chunk
 -> BGE Embeddings
--> ChromaDB
--> Retriever
+-> ChromaDB (in-memory)
+-> Adaptive Retriever (MMR)
 -> Gemini
 -> Answer + Sources
 """
@@ -18,6 +18,17 @@ import os
 import re
 import time
 from typing import List, Optional, Sequence
+
+# Streamlit Community Cloud ships an old system sqlite3 (< 3.35) which
+# chromadb refuses to run on. Swap in the pysqlite3-binary wheel (see
+# requirements.txt) *before* chromadb/langchain_chroma is imported anywhere.
+try:
+    __import__("pysqlite3")
+    import sys
+
+    sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+except ImportError:
+    pass
 
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
@@ -29,36 +40,37 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_huggingface import HuggingFaceEmbeddings
 
 
-# ---------------------------------------------------------------------------
-# Models
-# ---------------------------------------------------------------------------
-
 CHAT_MODEL = "gemini-3.5-flash-lite"
-
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 
 
-SYSTEM_PROMPT = """You are a helpful assistant that answers questions using ONLY the
-context provided below, which was retrieved from one or more PDF documents.
+SYSTEM_PROMPT = """You are a precise document-QA assistant. Answer using ONLY the
+context below, which was retrieved from one or more PDF documents. Accuracy matters
+more than completeness or fluency.
 
 Rules:
-- Answer strictly using the given context. Do not use outside knowledge.
+- Answer strictly using the given context. Never use outside knowledge, never guess,
+  and never fill gaps with something that "sounds right."
 - If the answer is not contained in the context, reply exactly with:
   "I don't know based on the provided document(s)."
-- If the question asks for a specific number of items, list EXACTLY that many.
-- If the context only partially answers the question, answer only the supported part.
-- Do not infer unsupported connections across documents.
-- When useful, mention which document(s) the answer came from.
-- Be concise and factual.
+- If the context only partially answers the question, answer only the supported part
+  and explicitly say which part is missing rather than inferring it.
+- Copy numbers, dates, names, and figures EXACTLY as written in the context. Do not
+  round, recalculate, or paraphrase them.
+- If the question asks for a specific number of items, list EXACTLY that many, and if
+  the context contains fewer than that number, say so instead of inventing extra ones.
+- If different chunks of context conflict with each other, point out the conflict
+  instead of silently picking one.
+- Do not infer unsupported connections across different documents or sections.
+- When useful, mention which document(s) (and page, if shown in the context) the
+  answer came from.
+- Answer in the same language the question was asked in.
+- Be concise and factual; use short bullet points for lists.
 
 Context:
 {context}
 """
 
-
-# ---------------------------------------------------------------------------
-# API key
-# ---------------------------------------------------------------------------
 
 def get_api_key(explicit_key: Optional[str] = None) -> str:
     key = explicit_key or os.environ.get("GOOGLE_API_KEY")
@@ -70,30 +82,13 @@ def get_api_key(explicit_key: Optional[str] = None) -> str:
     return key
 
 
-# ---------------------------------------------------------------------------
-# Embeddings
-# ---------------------------------------------------------------------------
-
 def get_embeddings(provider: Optional[str] = None):
-    """
-    Local BGE embeddings.
-    No Gemini embedding quota is used.
-    """
-
     return HuggingFaceEmbeddings(
         model_name=EMBEDDING_MODEL,
-        model_kwargs={
-            "device": "cpu"
-        },
-        encode_kwargs={
-            "normalize_embeddings": True
-        },
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True},
     )
 
-
-# ---------------------------------------------------------------------------
-# Gemini LLM
-# ---------------------------------------------------------------------------
 
 def get_llm(
     temperature: float = 0.0,
@@ -102,12 +97,12 @@ def get_llm(
     return ChatGoogleGenerativeAI(
         model=CHAT_MODEL,
         temperature=temperature,
+        # Keep answers deterministic and give enough headroom so longer
+        # "list everything" answers don't get cut off mid-sentence.
+        max_output_tokens=2048,
+        top_p=0.95,
     )
 
-
-# ---------------------------------------------------------------------------
-# PDF loading
-# ---------------------------------------------------------------------------
 
 def load_pdfs(pdf_paths: Sequence[str]) -> List[Document]:
     all_docs: List[Document] = []
@@ -126,13 +121,9 @@ def load_pdfs(pdf_paths: Sequence[str]) -> List[Document]:
     return all_docs
 
 
-# ---------------------------------------------------------------------------
-# Chunking
-# ---------------------------------------------------------------------------
-
 def split_documents(
     docs: List[Document],
-    chunk_size: int = 700,
+    chunk_size: int = 800,
     chunk_overlap: int = 80,
 ) -> List[Document]:
 
@@ -145,21 +136,22 @@ def split_documents(
     return splitter.split_documents(docs)
 
 
-# ---------------------------------------------------------------------------
-# Vector store
-# ---------------------------------------------------------------------------
-
 def build_vectorstore(
     chunks: List[Document],
     embeddings,
-    persist_directory: str,
+    persist_directory=None,
     collection_name: str = "rag_collection",
 ) -> Chroma:
+    """
+    In-memory ChromaDB.
+
+    No persist_directory is used, so Streamlit Cloud does not need
+    to write to a local SQLite database.
+    """
 
     vectordb = Chroma(
         collection_name=collection_name,
         embedding_function=embeddings,
-        persist_directory=persist_directory,
     )
 
     vectordb.add_documents(chunks)
@@ -167,20 +159,30 @@ def build_vectorstore(
     return vectordb
 
 
-# ---------------------------------------------------------------------------
-# Retriever
-# ---------------------------------------------------------------------------
-
 def get_retriever(
     vectordb: Chroma,
-    k: int = 3,
+    k: int = 4,
     sources: Optional[List[str]] = None,
-    score_threshold: Optional[float] = None,
+    search_type: str = "similarity",
 ):
+    """
+    Defaults to plain similarity search: for factual Q&A, pulling the
+    top-k *most relevant* chunks is more accurate than MMR, which
+    deliberately trades relevance for diversity and can drop a chunk
+    that repeats (but confirms) the right answer.
 
-    search_kwargs = {
-        "k": k
-    }
+    Pass search_type="mmr" if you specifically want broader, less
+    redundant coverage (e.g. for very open-ended "summarize everything"
+    style questions).
+    """
+    if search_type == "mmr":
+        search_kwargs = {
+            "k": k,
+            "fetch_k": max(k * 4, 20),
+            "lambda_mult": 0.5,
+        }
+    else:
+        search_kwargs = {"k": k}
 
     if sources:
         search_kwargs["filter"] = {
@@ -189,22 +191,11 @@ def get_retriever(
             }
         }
 
-    if score_threshold is not None:
-        search_kwargs["score_threshold"] = score_threshold
-
-        return vectordb.as_retriever(
-            search_type="similarity_score_threshold",
-            search_kwargs=search_kwargs,
-        )
-
     return vectordb.as_retriever(
-        search_kwargs=search_kwargs
+        search_type=search_type,
+        search_kwargs=search_kwargs,
     )
 
-
-# ---------------------------------------------------------------------------
-# Format docs
-# ---------------------------------------------------------------------------
 
 def _format_docs(docs: List[Document]) -> str:
     parts = []
@@ -221,12 +212,7 @@ def _format_docs(docs: List[Document]) -> str:
     return "\n\n---\n\n".join(parts)
 
 
-# ---------------------------------------------------------------------------
-# RAG chain
-# ---------------------------------------------------------------------------
-
 def build_rag_chain(llm: ChatGoogleGenerativeAI):
-
     prompt = ChatPromptTemplate.from_messages(
         [
             ("system", SYSTEM_PROMPT),
@@ -236,10 +222,6 @@ def build_rag_chain(llm: ChatGoogleGenerativeAI):
 
     return prompt | llm | StrOutputParser()
 
-
-# ---------------------------------------------------------------------------
-# Gemini rate limit handling
-# ---------------------------------------------------------------------------
 
 def _extract_retry_delay(
     error_text: str,
@@ -284,7 +266,6 @@ def _invoke_chain_with_retry(
             return chain.invoke(inputs)
 
         except Exception as e:
-
             if not _is_rate_limit_error(e):
                 raise
 
@@ -299,7 +280,6 @@ def _invoke_chain_with_retry(
             )
 
             time.sleep(wait_time)
-
             delay = min(delay * 2, 60)
 
     raise RuntimeError(
@@ -307,16 +287,11 @@ def _invoke_chain_with_retry(
     )
 
 
-# ---------------------------------------------------------------------------
-# Ask
-# ---------------------------------------------------------------------------
-
 def ask(
     retriever,
     chain,
     question: str,
 ):
-
     docs = retriever.invoke(question)
 
     if not docs:
@@ -338,12 +313,7 @@ def ask(
     return answer, docs
 
 
-# ---------------------------------------------------------------------------
-# Sources
-# ---------------------------------------------------------------------------
-
 def format_sources(docs: List[Document]) -> str:
-
     seen = set()
     lines = []
 

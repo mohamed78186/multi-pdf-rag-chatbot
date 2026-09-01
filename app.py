@@ -323,18 +323,22 @@ else:
                         for word in broad_words
                     )
 
-                    # Broad/"list everything" questions get a bigger
-                    # hybrid candidate pool, more chunks kept after
-                    # reranking, and a looser relevance bar (they may
-                    # need more chunks from the SAME document to be
-                    # complete). Specific factual questions get a
-                    # tighter pool and a stricter relevance bar. Either
-                    # way, every chunk that reaches the LLM has passed
-                    # through the cross-encoder reranker's score
-                    # threshold, so an unrelated document loaded in the
-                    # same session never gets pulled in just to fill k.
-                    final_k = 8 if is_broad else 4
-                    score_threshold = 0.15 if is_broad else 0.3
+                    # Broad/"list everything" questions keep more chunks
+                    # after reranking (they may need several chunks from
+                    # the SAME document to be complete) and, for small
+                    # document sets, skip top-k retrieval entirely in favor
+                    # of reranking every indexed chunk -- see
+                    # rag_utils.ask()'s FULL_POOL_CHUNK_LIMIT -- so a
+                    # relevant bullet point can't be missed just because it
+                    # didn't score in retrieval's initial cut. Specific
+                    # factual questions use a tighter, top-k-based pool.
+                    # Either way, chunk selection is rank-based (top_k
+                    # after cross-encoder reranking), not an absolute score
+                    # cutoff -- see rag_utils.rerank() -- so relevant
+                    # chunks aren't silently dropped by a miscalibrated
+                    # threshold, while an unrelated document loaded in the
+                    # same session still can't get pulled in just to fill k.
+                    final_k = 10 if is_broad else 4
                     pool_size = max(final_k * 4, 15)
 
                     llm = get_cached_llm()
@@ -351,7 +355,7 @@ else:
                         sources=selected_sources or None,
                         pool_size=pool_size,
                         final_k=final_k,
-                        score_threshold=score_threshold,
+                        is_broad=is_broad,
                     )
 
                     sources_md = format_sources(docs)

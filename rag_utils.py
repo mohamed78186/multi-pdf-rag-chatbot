@@ -74,6 +74,16 @@ BROAD_QUERY_WORDS = [
 BROAD_FETCH_K_MULTIPLIER = 2.0
 BROAD_TOP_N_MULTIPLIER = 2.5
 
+# Cross-encoder relevance cutoffs (see rerank_documents). ms-marco-MiniLM
+# outputs an unbounded relevance logit, not a 0-1 probability: higher =
+# more relevant, and a genuinely irrelevant chunk from an unrelated PDF
+# will typically score several points lower than a real match. These are
+# deliberately conservative (favor keeping a borderline chunk over
+# dropping a real one) - tune down RERANK_RELEVANCE_GAP if you still see
+# unrelated sources slipping into answers.
+RERANK_MIN_SCORE = -3.0
+RERANK_RELEVANCE_GAP = 6.0
+
 
 def is_broad_query(question: str) -> bool:
     """Heuristic: does this question ask for an enumeration/full listing?"""
@@ -301,8 +311,26 @@ def rerank_documents(
     question: str,
     docs: List[Document],
     top_n: int = DEFAULT_TOP_N,
+    relevance_gap: float = RERANK_RELEVANCE_GAP,
+    min_score: float = RERANK_MIN_SCORE,
 ) -> List[Document]:
-    """Re-score deduplicated candidates with a cross-encoder and keep top_n."""
+    """
+    Re-score deduplicated candidates with a cross-encoder and keep the
+    relevant ones, up to top_n.
+
+    top_n is a CEILING, not a target: if the corpus contains multiple
+    unrelated PDFs (e.g. a CV + an unrelated slide deck) and only a few
+    chunks are truly relevant to the question, we must not "pad" the
+    remaining slots with the next-best-available but still irrelevant
+    chunks from a different document. We do this with two safeguards:
+
+    1. min_score: an absolute floor. Chunks scored below this by the
+       cross-encoder are considered irrelevant regardless of anything else.
+    2. relevance_gap: a relative floor. Chunks scored much lower than the
+       single best-matching chunk for this question are dropped, even if
+       they technically clear min_score - they're just not in the same
+       league as the real answer.
+    """
 
     unique_docs = _dedupe_docs(docs)
 
@@ -318,7 +346,15 @@ def rerank_documents(
         reverse=True,
     )
 
-    return [doc for _, doc in scored[:top_n]]
+    top_score = scored[0][0]
+
+    relevant = [
+        (score, doc)
+        for score, doc in scored
+        if score >= min_score and score >= (top_score - relevance_gap)
+    ]
+
+    return [doc for _, doc in relevant[:top_n]]
 
 
 def _format_docs(docs: List[Document]) -> str:

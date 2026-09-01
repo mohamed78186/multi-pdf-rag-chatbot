@@ -252,6 +252,9 @@ if process_clicked:
 
 st.title("📚 Multi-PDF RAG Chatbot")
 
+st.caption(
+    "BGE Embeddings + BM25 Hybrid Search + Cross-Encoder Reranking + Gemini"
+)
 
 
 if not st.session_state.vectordb:

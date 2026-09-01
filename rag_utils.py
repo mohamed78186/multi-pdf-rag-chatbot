@@ -108,7 +108,14 @@ def resolve_retrieval_params(
     return fetch_k, top_n
 
 
-SYSTEM_PROMPT = """You are a precise research assistant. Answer the user's question
+# Canonical "no answer" message. Used both in the prompt (so the LLM knows
+# the exact string to reply with) and in ask() (so we can detect that exact
+# reply and avoid showing misleading "Sources" for an answer that isn't
+# actually grounded in them). Keeping a single constant means the two can
+# never drift out of sync.
+NO_ANSWER_MSG = "I don't know based on the provided document(s)."
+
+SYSTEM_PROMPT = f"""You are a precise research assistant. Answer the user's question
 using ONLY the context excerpts below, which were retrieved from the user's PDF
 document(s).
 
@@ -116,7 +123,7 @@ Rules (follow strictly):
 1. Base your answer strictly on the given context. Never use outside knowledge,
    even if you are confident it is correct.
 2. If the context does not contain the answer, reply exactly:
-   "I don't know based on the provided document(s)."
+   "{NO_ANSWER_MSG}"
 3. If the context only partially answers the question, answer only the
    supported part, and say explicitly which part is not covered.
 4. Copy numbers, dates, names, and technical terms exactly as written in the
@@ -132,7 +139,7 @@ Rules (follow strictly):
    beyond what rule 2/3 require.
 
 Context:
-{context}
+{{context}}
 """
 
 
@@ -161,10 +168,7 @@ def get_reranker(model_name: str = RERANKER_MODEL):
     return CrossEncoder(model_name, max_length=512)
 
 
-def get_llm(
-    temperature: float = 0.0,
-    provider: Optional[str] = None,
-):
+def get_llm(temperature: float = 0.0):
     return ChatGoogleGenerativeAI(
         model=CHAT_MODEL,
         temperature=temperature,
@@ -459,10 +463,7 @@ def ask(
     docs = rerank_documents(reranker, question, raw_docs, top_n=top_n)
 
     if not docs:
-        return (
-            "I don't know based on the provided document(s).",
-            [],
-        )
+        return (NO_ANSWER_MSG, [])
 
     context = _format_docs(docs)
 
@@ -473,6 +474,13 @@ def ask(
             "question": question,
         },
     )
+
+    # The reranker can still let through a few weakly-related chunks (that's
+    # by design - see rerank_documents' relevance_gap comment). If the LLM
+    # itself decided those chunks weren't enough to answer, don't show them
+    # as "Sources" - that would wrongly imply the answer came from them.
+    if answer.strip() == NO_ANSWER_MSG:
+        return (answer, [])
 
     return answer, docs
 

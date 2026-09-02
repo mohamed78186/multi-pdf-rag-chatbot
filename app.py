@@ -97,7 +97,7 @@ with st.sidebar:
         "Chunk size",
         min_value=400,
         max_value=1500,
-        value=800,
+        value=1000,
         step=100,
     )
 
@@ -252,9 +252,7 @@ if process_clicked:
 
 st.title("📚 Multi-PDF RAG Chatbot")
 
-st.caption(
-    "BGE Embeddings + BM25 Hybrid Search + Cross-Encoder Rerank + ChromaDB + Gemini"
-)
+
 
 
 if not st.session_state.vectordb:

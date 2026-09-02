@@ -357,15 +357,13 @@ def rerank(
     Re-scores each (query, chunk) pair with the cross-encoder and returns
     the top_k most relevant chunks, best-first.
 
-    Every chunk (not just the best one) must individually clear the floor
-    (_RERANK_FLOOR, or score_threshold if given) before top_k is applied.
-    The floor is deliberately lenient raw-logit territory (see
-    _RERANK_FLOOR above), so it only screens out chunks the reranker finds
-    essentially unrelated to the question -- it won't reject a genuinely
-    relevant-but-not-top-ranked chunk. This is what keeps an unrelated
-    document loaded in the same session from riding along in the Sources
-    list just to fill up top_k slots behind one strong match, while still
-    letting ask() say "I don't know" when nothing in the pool clears it.
+    Selection is by RANK (top_k), not by an absolute score cutoff -- see
+    _RERANK_FLOOR above for why. score_threshold, if given, is only used as
+    a minimum on the *best* chunk's raw score: if even the top match is
+    below it, the whole pool is treated as irrelevant and an empty list is
+    returned (this is what lets ask() correctly say "I don't know" when
+    nothing retrieved actually answers the question, without also
+    discarding weaker-but-still-correct chunks lower in a valid answer).
     """
     if not docs:
         return []
@@ -380,7 +378,8 @@ def rerank(
     )
 
     floor = _RERANK_FLOOR if score_threshold is None else score_threshold
-    scored = [(doc, score) for doc, score in scored if score >= floor]
+    if not scored or scored[0][1] < floor:
+        return []
 
     return [doc for doc, _score in scored[:top_k]]
 

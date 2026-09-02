@@ -109,6 +109,24 @@ with st.sidebar:
         step=20,
     )
 
+    relevance_strictness = st.slider(
+        "Relevance strictness",
+        min_value=-12.0,
+        max_value=4.0,
+        value=-4.0,
+        step=0.5,
+        help=(
+            "Raw cross-encoder reranker score below which a retrieved "
+            "chunk is dropped entirely, per chunk (see rag_utils.rerank). "
+            "Raise it if you're seeing chunks from an unrelated PDF in "
+            "Sources / the answer. Lower it if you're getting "
+            "\"I don't know\" for questions the document(s) actually "
+            "answer. There's no universal correct value -- it depends on "
+            "the reranker model and your documents, so tune it live "
+            "against your own questions instead of guessing in code."
+        ),
+    )
+
     process_clicked = st.button(
         "🔄 Process PDFs",
         use_container_width=True,
@@ -332,12 +350,13 @@ else:
                     # relevant bullet point can't be missed just because it
                     # didn't score in retrieval's initial cut. Specific
                     # factual questions use a tighter, top-k-based pool.
-                    # Either way, chunk selection is rank-based (top_k
-                    # after cross-encoder reranking), not an absolute score
-                    # cutoff -- see rag_utils.rerank() -- so relevant
-                    # chunks aren't silently dropped by a miscalibrated
-                    # threshold, while an unrelated document loaded in the
-                    # same session still can't get pulled in just to fill k.
+                    # Either way, every chunk is filtered individually
+                    # against `relevance_strictness` (the sidebar slider)
+                    # before top_k is applied in rag_utils.rerank() -- so a
+                    # weak/unrelated chunk from a second PDF loaded in the
+                    # same session can't ride along just to fill up top_k
+                    # behind one strong match, while a genuinely relevant
+                    # chunk that simply isn't the #1 match still gets kept.
                     final_k = 10 if is_broad else 4
                     pool_size = max(final_k * 4, 15)
 
@@ -355,6 +374,7 @@ else:
                         sources=selected_sources or None,
                         pool_size=pool_size,
                         final_k=final_k,
+                        score_threshold=relevance_strictness,
                         is_broad=is_broad,
                     )
 
